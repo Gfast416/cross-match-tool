@@ -19,8 +19,8 @@
  * Speed: parallel batched fetches for all venues per run
  */
 
-const axios = require('axios');
-const fs = require('fs');
+import axios from 'axios';
+import fs from 'fs';
 
 // Config
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -371,6 +371,112 @@ async function getFileSha(path) {
 }
 
 /**
+ * Normalize pool data from different DEX formats into a uniform structure.
+ * Supports DLMM and DAMM pool formats from Meteora.
+ * @param {Array<Object>} rows - raw pool data from DEX API
+ * @param {string} type - 'dlmm' or 'damm'
+ * @param {number} minTvl - minimum TVL threshold
+ * @returns {Map<string, Object>} map of tokenMint -> normalized pool data
+ */
+function normalizePool(rows, type, minTvl = 100) {
+  const poolMap = new Map();
+
+  for (const row of rows) {
+    try {
+      let tokenMint, priceUsd, tvlUsd, volume24h, reserves;
+
+      if (type === 'dlmm') {
+        // DLMM pool format
+        tokenMint = row.mint || row.tokenMint || '';
+        priceUsd = Number(row.price_usd || row.priceUsd || 0);
+        tvlUsd = Number(row.tvl_usd || row.tvlUsd || row.reserveUsd || 0);
+        volume24h = Number(row.volume_24h_usd || row.volume24hUsd || 0);
+        reserves = { reserve0: Number(row.reserve0 || 0), reserve1: Number(row.reserve1 || 0) };
+      } else if (type === 'damm') {
+        // DAMM pool format
+        tokenMint = row.token_a_mint || row.tokenAMint || row.mint || '';
+        priceUsd = Number(row.price_usd || row.priceUsd || 0);
+        tvlUsd = Number(row.tvl_usd || row.tvlUsd || row.reserveUsd || 0);
+        volume24h = Number(row.volume_24h_usd || row.volume24hUsd || 0);
+        reserves = { reserve0: Number(row.reserve0 || 0), reserve1: Number(row.reserve1 || 0) };
+      } else {
+        // Generic fallback
+        tokenMint = row.tokenMint || row.mint || row.tokenA || '';
+        priceUsd = Number(row.price || row.tokenPrice || 0);
+        tvlUsd = Number(row.tvl || row.liquidityUsd || 0);
+        volume24h = Number(row.volume24h || row.vol24h || 0);
+        reserves = { reserve0: Number(row.reserve0 || 0), reserve1: Number(row.reserve1 || 0) };
+      }
+
+      // Only include pools with sufficient TVL and valid data
+      if (tokenMint && priceUsd > 0 && tvlUsd >= minTvl) {
+        poolMap.set(tokenMint, {
+          venue: type,
+          tokenMint,
+          priceUsd,
+          tvlUsd,
+          volume24h,
+          reserve0: reserves.reserve0,
+          reserve1: reserves.reserve1,
+          raw: row
+        });
+      }
+    } catch (err) {
+      // Skip malformed entries
+      console.warn(`[normalizePool] skipping malformed ${type} pool:`, err.message);
+    }
+  }
+
+  return poolMap;
+}
+
+/**
+ * Find arbitrage candidates between two pool venues.
+ * Compares prices and calculates mispricing percentage.
+ * @param {Object} poolA - normalized pool from venue A
+ * @param {Object} poolB - normalized pool from venue B
+ * @param {number} jupiterPrice - reference price from Jupiter
+ * @param {number} minMispricingPct - minimum mispricing percentage threshold
+ * @returns {Object|null} candidate object or null if no mispricing
+ */
+function findCandidates(poolA, poolB, jupiterPrice, minMispricingPct = 1.0) {
+  if (!poolA || !poolB || !jupiterPrice || jupiterPrice <= 0) return null;
+
+  const priceA = Number(poolA.priceUsd || 0);
+  const priceB = Number(poolB.priceUsd || 0);
+
+  if (priceA <= 0 || priceB <= 0) return null;
+
+  // Calculate mispricing between venues
+  const priceDiff = Math.abs(priceA - priceB);
+  const lowerPrice = Math.min(priceA, priceB);
+  const mispricingPct = (priceDiff / lowerPrice) * 100;
+
+  // Only consider if mispricing exceeds threshold
+  if (mispricingPct < minMispricingPct) return null;
+
+  const direction = priceA > priceB ? 'SELL_A_BUY_B' : 'BUY_A_SELL_B';
+
+  return {
+    baseMint: poolA.tokenMint,
+    name: `${poolA.raw?.name || poolA.tokenMint.slice(0, 8)}...`,
+    direction,
+    mispricingPct,
+    dlmm: {
+      priceUsd: priceA,
+      tvlUsd: Number(poolA.tvlUsd || 0),
+      volume24h: Number(poolA.volume24h || 0)
+    },
+    damm: {
+      priceUsd: priceB,
+      tvlUsd: Number(poolB.tvlUsd || 0),
+      volume24h: Number(poolB.volume24h || 0)
+    },
+    jupiterPrice
+  };
+}
+
+/**
  * Generate cross-match report
  * @param {Array<Object>} matches
  */
@@ -410,29 +516,23 @@ async function main() {
   console.log(`[scanner] ${matches.length} cross-match opportunities found.`);
 }
 
-// Export for programmatic use
-module.exports = {
-  filterLayer1,
-  filterLayer2,
-  filterLayer3,
-  runFullScan,
-  runFilterPipeline: async (rawPairs) => {
-    const l1 = filterLayer1(rawPairs);
-    const l2 = filterLayer2(l1);
-    const l3 = await filterLayer3(l2);
-    return l3;
-  },
-  fetchRaydiumPools,
-  fetchOrcaPools,
-  fetchMeteoraPools,
-  fetchJupiterPrices,
-  uploadFile,
-  createRepo,
-  repoExists,
-  retry
-};
+/**
+ * Run the full filter pipeline programmatically
+ * @param {Array<Object>} rawPairs
+ * @returns {Promise<Array<Object>>}
+ */
+async function runFilterPipeline(rawPairs) {
+  const l1 = filterLayer1(rawPairs);
+  const l2 = filterLayer2(l1);
+  const l3 = await filterLayer3(l2);
+  return l3;
+}
 
-if (require.main === module) {
+// Export for programmatic use
+export { filterLayer1, filterLayer2, filterLayer3, runFullScan, runFilterPipeline, fetchRaydiumPools, fetchOrcaPools, fetchMeteoraPools, fetchJupiterPrices, uploadFile, createRepo, repoExists, retry, normalizePool, findCandidates, generateReport };
+
+// Run main if this file is executed directly
+if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch(err => {
     console.error('[scanner] fatal error:', err.message);
     process.exit(1);
