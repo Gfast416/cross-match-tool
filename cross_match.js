@@ -26,12 +26,20 @@ async function fetchTokenPrice(mint) {
 }
 
 async function fetchPage(url, page, pageSize) {
-  const resp = await axios.get(url, {
-    params: { page, page_size: pageSize, sort_by: 'tvl:desc' },
-    timeout: 30000,
-    headers: { 'User-Agent': 'CrossMatchBot/1.0' }
-  });
-  return resp.data;
+  try {
+    const resp = await axios.get(url, {
+      params: { page, page_size: pageSize, sort_by: 'tvl:desc' },
+      timeout: 30000,
+      headers: { 'User-Agent': 'CrossMatchBot/1.0' }
+    });
+    // API returns { total, pages, current_page, page_size, data: [...] }
+    const result = resp.data?.data || resp.data || [];
+    console.log(`[fetchPage] ${url.split('/').pop()} page ${page}: ${result.length} pools`);
+    return result;
+  } catch (err) {
+    console.warn(`[fetchPage] ERROR fetching ${url}:`, err.message);
+    return [];
+  }
 }
 
 async function refresh() {
@@ -43,8 +51,8 @@ async function refresh() {
     fetchPage(DAMM_API, 1, 200)
   ]);
 
-  const dlmmRows = dlmmFirst.data || [];
-  const dammRows = dammFirst.data || [];
+  const dlmmRows = dlmmFirst || [];
+  const dammRows = dammFirst || [];
   console.log(`📦 Pools fetched: ${dlmmRows.length} DLMM, ${dammRows.length} DAMM`);
 
   const dlmmPoolMap = normalizePool(dlmmRows, 'dlmm', MIN_TVL);
@@ -71,7 +79,7 @@ async function refresh() {
     console.log(`  ${i+1}. Token: ${c.baseMint.slice(0,8)}... | ${c.direction} | Mispricing: ${c.mispricingPct.toFixed(2)}%`);
     console.log(`     DLMM: ${c.dlmm.priceUsd.toExponential(3)} | TVL: $${c.dlmm.tvlUsd.toFixed(0)} | Vol24h: ${c.dlmm.volume24h.toFixed(0)}`);
     console.log(`     DAMM: ${c.damm.priceUsd.toExponential(3)} | TVL: $${c.damm.tvlUsd.toFixed(0)} | Vol24h: ${c.damm.volume24h.toFixed(0)}`);
-    console.log(`     Jupiter ref: $${jupiterPrice.toFixed(6)}`);
+    console.log(`     Jupiter ref: $${c.jupiterPrice.toFixed(6)}`);
   });
 
   console.log(`\n⏰ Next check in 30 seconds...\n`);
