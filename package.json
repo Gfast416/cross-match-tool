@@ -1,16 +1,21 @@
 {
   "name": "cross-match-tool",
-  "version": "1.0.0",
-  "description": "Dynamic cross-match scanner for Solana DEX token pairs",
+  "version": "1.2.0",
+  "description": "Dynamic cross-match scanner for Solana DEX token pairs — live-ready, fee-efficient",
   "type": "module",
-  "main": "scanner.js",
+  "main": "cross_match.js",
   "scripts": {
-    "scan": "node scanner.js",
-    "cross": "node cross_match.js",
+    "start": "node cross_match.js",
+    "scan": "node cross_match.js",
     "deploy": "node deploy.js",
-    "verify": "node verify.js"
+    "verify": "node verify.js",
+    "test": "node --check scanner.js && node --check cross_match.js && node --check deploy.js && node --check verify.js"
   },
   "dependencies": {
-    "axios": "^1.19.0"
+    "axios": "^1.19.0",
+    "dotenv": "^16.6.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
