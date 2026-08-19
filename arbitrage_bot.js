@@ -34,7 +34,7 @@ import 'dotenv/config';
 import BN from 'bn.js';
 import { normalizePool, findCandidates, fetchAllPages } from './scanner.js';
 
-import { Connection, PublicKey, Keypair, Transaction } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
 // ---------- Config ----------
 const MODE = (process.env.MODE || 'dry-run').toLowerCase();
@@ -196,7 +196,6 @@ import {
   createCloseAccountInstruction,
   NATIVE_MINT, TOKEN_PROGRAM_ID
 } from '@solana/spl-token';
-import { TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
 let connection = null, wallet = null, CpAmm = null, DLMM = null;
 
@@ -307,6 +306,18 @@ async function sendAndConfirm(tx, label) {
   return sig;
 }
 
+// Determine DLMM swapForY from the actual input mint.
+// DLMM swapForY = true  => swap X for Y (input is tokenX, output is tokenY)
+// DLMM swapForY = false => swap Y for X (input is tokenY, output is tokenX)
+function dlmmSwapForY(dlmmPool, inputMint) {
+  return dlmmPool.tokenX.publicKey.toBase58() === inputMint;
+}
+
+// Compute-unit slippage for DLMM swapQuote (basis points; 100 = 1%)
+function dlmmSlippageBps() {
+  return new BN(Math.max(1, Math.round((parseFloat(process.env.SLIPPAGE_PCT || '1.0')) * 100)));
+}
+
 async function executeLive(route) {
   await initLive();
   const tokenMint = new PublicKey(route.tokenMint);
@@ -314,12 +325,16 @@ async function executeLive(route) {
   const poolAddress = new PublicKey(tokenPool.address);
   const lamports = route.startAmountLamports;
 
+  // DLMM/DAMMv2 only accept WSOL, not native SOL — wrap once up front.
+  const { ixs: wrapIxs } = await prepareWsol(lamports);
+
+  let sigs = [];
   if (route.buyOnDlmm) {
     // ---------- Leg 1: SOL -> token on DLMM ----------
     const dlmmPool = await DLMM.create(connection, poolAddress, { cluster: 'mainnet-beta' });
-    const swapForY = dlmmPool.tokenX.publicKey.toBase58() === WSOL_MINT; // SOL is X => swap for Y
-    const binArrays = await dlmmPool.getBinArrayForSwap(!swapForY);
-    const quote = await dlmmPool.swapQuote(new BN(lamports), !swapForY, new BN(1), binArrays);
+    const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL (X or Y?)
+    const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+    const quote = await dlmmPool.swapQuote(new BN(lamports), swapForY, dlmmSlippageBps(), binArrays);
     let tx = await dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
@@ -329,15 +344,16 @@ async function executeLive(route) {
       minOutAmount: quote.minOutAmount,
       outToken: dlmmPool.tokenY.publicKey
     });
+    tx.instructions = [...wrapIxs, ...tx.instructions]; // wrap SOL->WSOL first
     tx = await addFeeOptimization(tx, 600_000);
     const sig1 = await sendAndConfirm(tx, 'DLMM swap');
+    sigs.push(sig1);
 
     // ---------- Leg 2: token -> USDC on DAMMv2 ----------
     const dammRaw = route.dammPool.raw;
     const dammAddr = new PublicKey(dammRaw.address);
     const cpAmm = new CpAmm(connection);
     const poolState = await cpAmm.fetchPoolState(dammAddr);
-    // tight minimum-out from a real DAMMv2 quote (anti-slippage)
     const dammQuote2 = await cpAmm.getQuote({
       inAmount: quote.outAmount,
       inputTokenMint: tokenMint,
@@ -354,7 +370,7 @@ async function executeLive(route) {
       pool: dammAddr,
       inputTokenMint: tokenMint,
       outputTokenMint: new PublicKey(USDC_MINT),
-      amountIn: quote.outAmount, // use actual received (minus fee), safe
+      amountIn: quote.outAmount,
       minimumAmountOut: minOut2,
       tokenAMint: poolState.tokenAMint,
       tokenBMint: poolState.tokenBMint,
@@ -367,17 +383,15 @@ async function executeLive(route) {
     });
     tx2 = await addFeeOptimization(tx2, 400_000);
     const sig2 = await sendAndConfirm(tx2, 'DAMMv2 swap');
-    return { sent: true, venue: 'DLMM→DAMMv2', sigs: [sig1, sig2] };
+    sigs.push(sig2);
   } else {
     // ---------- Leg 1: SOL -> token on DAMMv2 ----------
     const cpAmm = new CpAmm(connection);
     const poolState = await cpAmm.fetchPoolState(poolAddress);
-    const { ixs: wrapIxs } = await prepareWsol(lamports);
-    // estimate leg-1 output so leg-2 (DLMM) can be quoted with the REAL amount
     const dammQuote = await cpAmm.getQuote({
       inAmount: new BN(lamports),
       inputTokenMint: new PublicKey(WSOL_MINT),
-      slippage: 1,
+      slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'),
       poolState,
       currentTime: Math.floor(Date.now() / 1000),
       currentSlot: 0,
@@ -404,15 +418,16 @@ async function executeLive(route) {
     tx.instructions = [...wrapIxs, ...tx.instructions];
     tx = await addFeeOptimization(tx, 400_000);
     const sig1 = await sendAndConfirm(tx, 'DAMMv2 swap');
+    sigs.push(sig1);
 
     // ---------- Leg 2: token -> USDC on DLMM ----------
     const dlmmRaw = route.dlmmPool.raw;
     const dlmmAddr = new PublicKey(dlmmRaw.address);
     const dlmmPool = await DLMM.create(connection, dlmmAddr, { cluster: 'mainnet-beta' });
-    const swapForY = dlmmPool.tokenX.publicKey.toBase58() === WSOL_MINT;
-    const binArrays = await dlmmPool.getBinArrayForSwap(!swapForY);
+    const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token (not SOL)
+    const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
     const leg2In = dammQuote?.swapOutAmount || new BN(0);
-    const quote = await dlmmPool.swapQuote(leg2In, !swapForY, new BN(1), binArrays);
+    const quote = await dlmmPool.swapQuote(leg2In, swapForY, dlmmSlippageBps(), binArrays);
     let tx2 = await dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
@@ -424,9 +439,13 @@ async function executeLive(route) {
     });
     tx2 = await addFeeOptimization(tx2, 600_000);
     const sig2 = await sendAndConfirm(tx2, 'DLMM swap');
-    const sig3 = await closeWsol(); // recover any leftover WSOL back to SOL
-    return { sent: true, venue: 'DAMMv2→DLMM', sigs: sig3 ? [sig1, sig2, sig3] : [sig1, sig2] };
+    sigs.push(sig2);
   }
+
+  // Recover any leftover WSOL back to SOL (non-fatal).
+  const sig3 = await closeWsol();
+  if (sig3) sigs.push(sig3);
+  return { sent: true, venue: route.buyOnDlmm ? 'DLMM→DAMMv2' : 'DAMMv2→DLMM', sigs };
 }
 
 // ---------- Main loop ----------
