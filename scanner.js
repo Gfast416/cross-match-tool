@@ -194,6 +194,49 @@ async function fetchRaydiumPools() {
 }
 
 /**
+ * Fetch ALL pools from a paginated API endpoint (up to maxPages)
+ * Used by cross_match.js for comprehensive DLMM/DAMM scanning
+ * @param {string} apiName - label for logging
+ * @param {string} url - base API URL
+ * @param {number} maxPages - max number of pages to fetch (default: 5)
+ * @param {number} pageSize - pools per page (default: 500)
+ * @returns {Promise<Array<Object>>} all pools from all pages
+ */
+async function fetchAllPages(apiName, url, maxPages = 5, pageSize = 500) {
+  console.log(`[${apiName}] Fetching up to ${maxPages} pages (${maxPages * pageSize} pools)...`);
+
+  const allPools = [];
+  let totalPools = 0;
+
+  for (let page = 1; page <= maxPages; page++) {
+    try {
+      const resp = await axios.get(url, {
+        params: { page, page_size: pageSize, sort_by: 'tvl:desc' },
+        timeout: 30000,
+        headers: { 'User-Agent': 'CrossMatchBot/1.0' }
+      });
+
+      const pools = resp.data?.data || resp.data || [];
+      allPools.push(...pools);
+      totalPools += pools.length;
+
+      if (pools.length === 0) {
+        console.log(`[${apiName}] Page ${page}: empty, stopping pagination`);
+        break;
+      }
+
+      console.log(`[${apiName}] Page ${page}/${maxPages}: fetched ${pools.length} pools (total: ${totalPools})`);
+    } catch (err) {
+      console.warn(`[${apiName}] Page ${page} failed: ${err.message}`);
+      break; // Stop pagination on error
+    }
+  }
+
+  console.log(`[${apiName}] Total pools fetched: ${totalPools}`);
+  return allPools;
+}
+
+/**
  * Fetch all whirlpools from Orca API dynamically
  * @returns {Promise<Array<Object>>}
  */
@@ -539,7 +582,7 @@ async function runFilterPipeline(rawPairs) {
 }
 
 // Export for programmatic use
-export { filterLayer1, filterLayer2, filterLayer3, runFullScan, runFilterPipeline, fetchRaydiumPools, fetchOrcaPools, fetchMeteoraPools, fetchJupiterPrices, uploadFile, createRepo, repoExists, retry, normalizePool, findCandidates, generateReport };
+export { filterLayer1, filterLayer2, filterLayer3, runFullScan, runFilterPipeline, fetchRaydiumPools, fetchOrcaPools, fetchMeteoraPools, fetchJupiterPrices, uploadFile, createRepo, repoExists, retry, normalizePool, findCandidates, generateReport, fetchAllPages };
 
 // Run main if this file is executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
