@@ -383,29 +383,21 @@ function normalizePool(rows, type, minTvl = 100) {
 
   for (const row of rows) {
     try {
-      let tokenMint, priceUsd, tvlUsd, volume24h, reserves;
+      let tokenMint, priceUsd, tvlUsd, volume24h;
 
-      if (type === 'dlmm') {
-        // DLMM pool format
-        tokenMint = row.mint || row.tokenMint || '';
-        priceUsd = Number(row.price_usd || row.priceUsd || 0);
-        tvlUsd = Number(row.tvl_usd || row.tvlUsd || row.reserveUsd || 0);
-        volume24h = Number(row.volume_24h_usd || row.volume24hUsd || 0);
-        reserves = { reserve0: Number(row.reserve0 || 0), reserve1: Number(row.reserve1 || 0) };
-      } else if (type === 'damm') {
-        // DAMM pool format
-        tokenMint = row.token_a_mint || row.tokenAMint || row.mint || '';
-        priceUsd = Number(row.price_usd || row.priceUsd || 0);
-        tvlUsd = Number(row.tvl_usd || row.tvlUsd || row.reserveUsd || 0);
-        volume24h = Number(row.volume_24h_usd || row.volume24hUsd || 0);
-        reserves = { reserve0: Number(row.reserve0 || 0), reserve1: Number(row.reserve1 || 0) };
+      if (type === 'dlmm' || type === 'damm') {
+        // Meteora DLMM/DAMM pool format (actual API response)
+        // Price is in current_price, TVL in tvl, volume in volume["24h"]
+        tokenMint = row.token_x?.address || row.tokenX?.address || row.token_a_mint || row.tokenAMint || row.mint || '';
+        priceUsd = Number(row.current_price || row.currentPrice || row.token_x?.price || row.token_y?.price || 0);
+        tvlUsd = Number(row.tvl || row.tvlUsd || row.liquidityUsd || row.reserveUsd || 0);
+        volume24h = Number(row.volume?.['24h'] || row.volume?.h24 || row.volume24h || row.vol24h || 0);
       } else {
-        // Generic fallback
+        // Generic fallback for other exchanges
         tokenMint = row.tokenMint || row.mint || row.tokenA || '';
-        priceUsd = Number(row.price || row.tokenPrice || 0);
-        tvlUsd = Number(row.tvl || row.liquidityUsd || 0);
-        volume24h = Number(row.volume24h || row.vol24h || 0);
-        reserves = { reserve0: Number(row.reserve0 || 0), reserve1: Number(row.reserve1 || 0) };
+        priceUsd = Number(row.price || row.tokenPrice || row.current_price || 0);
+        tvlUsd = Number(row.tvl || row.liquidityUsd || row.reserveUsd || 0);
+        volume24h = Number(row.volume24h || row.vol24h || row['24hVolume'] || 0);
       }
 
       // Only include pools with sufficient TVL and valid data
@@ -416,8 +408,8 @@ function normalizePool(rows, type, minTvl = 100) {
           priceUsd,
           tvlUsd,
           volume24h,
-          reserve0: reserves.reserve0,
-          reserve1: reserves.reserve1,
+          reserve0: Number(row.reserve0 || row.token_x_amount || 0),
+          reserve1: Number(row.reserve1 || row.token_y_amount || 0),
           raw: row
         });
       }
