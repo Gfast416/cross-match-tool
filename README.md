@@ -119,10 +119,27 @@ Estimasi total per siklus (2 swap): **~$0.00002–$0.0002** — jauh di bawah pr
 - Default **dry-run**: tidak ada dana yang berpindah.
 - Mode **live** otomatis di-gate oleh cek net-profit (sama seperti dry-run) — skip kalau
   estimasi di bawah `MIN_PROFIT_PCT`.
+- **Verifikasi pool langsung via SDK Meteora** (read-only quote) setelah nemu kandidat:
+  kalau pool mati / "price differs >5% from market", otomatis **skip** (tidak trade stale pool).
 - `minimumAmountOut` diperketat dari quote riil SDK (anti-slippage via `SLIPPAGE_PCT`).
 - Private key hanya dibaca dari `.env`; `.gitignore` memblokir `.env` & `node_modules`.
 - **Live on-chain belum diuji di mainnet oleh pembuat** — jalankan pertama dengan
   `TRADE_AMOUNT_SOL=0.01` untuk verifikasi end-to-end.
+
+### ⚠️ Requirement Node.js untuk Mode Live
+
+SDK Meteora (`@meteora-ag/dlmm`, `@meteora-ag/cp-amm-sdk`) butuh **Node.js 18 atau 20 (LTS)**.
+Di **Node 22+ (termasuk 26)**, SDK gagal load karena isu kompatibilitas ESM↔CJS
+(`@coral-xyz/anchor`) — bot akan menampilkan pesan instruktif, bukan crash.
+
+- Termux: `pkg install nodejs` (biasanya Node 18/20) → live mode jalan normal.
+- Jika memaksa Node 26: jalankan **tanpa `RPC_URL`** (dry-run aman) atau turunkan Node.
+
+### Penyaringan Kandidat (noise & dead pool)
+
+- Token *quote* (SOL/USDC/USDT) sebagai base di-skip otomatis — rute `SOL→WSOL→USDC` absurd.
+- Filter dead-pool scanner: tolak pool yang harganya >`DEAD_POOL_PCT` (default 5%) dari oracle
+  Jupiter. Untuk memperpresisi, set `DEAD_POOL_PCT=5` di `.env` (standar penolakan Meteora).
 
 ---
 

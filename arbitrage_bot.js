@@ -53,6 +53,12 @@ const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/quote';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkYWkuDt1v';
+const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+// Tokens we use as quote/input — never treat a pool whose base is one of these as an arb target.
+const QUOTE_MINTS = new Set([WSOL_MINT, USDC_MINT, USDT_MINT]);
+
+// Dead-pool threshold (%) — Meteora rejects swaps when pool price is >5% from market.
+const DEAD_POOL_PCT = parseFloat(process.env.DEAD_POOL_PCT || '5.0');
 
 // ---------- Serialized logging ----------
 const logBuffer = [];
@@ -199,14 +205,27 @@ import {
 
 let connection = null, wallet = null, CpAmm = null, DLMM = null;
 
+async function initRead() {
+  if (connection) return;
+  try {
+    const { default: _DLMM } = await import('@meteora-ag/dlmm');
+    const _CpAmm = (await import('@meteora-ag/cp-amm-sdk')).default;
+    DLMM = _DLMM;
+    CpAmm = _CpAmm;
+    connection = new Connection(process.env.RPC_URL, 'confirmed');
+  } catch (e) {
+    throw new Error(
+      `Gagal load SDK Meteora (${e.message.split('\n')[0]}).\n` +
+      `Live/probe butuh Node.js 18/20. Node 22+ (termasuk 26) belum kompatibel dgn SDK Meteora (isian ESM↔CJS @coral-xyz/anchor).\n` +
+      `Turunkan ke Node 18/20 (Termux: pkg install nodejs) atau jalankan tanpa RPC_URL (dry-run aman).`
+    );
+  }
+}
+
 async function initLive() {
   if (connection) return;
-  const { default: _DLMM } = await import('@meteora-ag/dlmm');
-  const _CpAmm = (await import('@meteora-ag/cp-amm-sdk')).default;
-  DLMM = _DLMM;
-  CpAmm = _CpAmm;
-  // 'finalized' = more reliable on free Helius; 'confirmed' is fine & faster too
-  connection = new Connection(process.env.RPC_URL, 'confirmed');
+  if (!process.env.WALLET_PRIVATE_KEY) throw new Error('WALLET_PRIVATE_KEY diperlukan untuk live mode.');
+  await initRead();
   const secret = JSON.parse(Buffer.from(process.env.WALLET_PRIVATE_KEY, 'base64').toString('utf8'));
   wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
 }
@@ -448,6 +467,59 @@ async function executeLive(route) {
   return { sent: true, venue: route.buyOnDlmm ? 'DLMM→DAMMv2' : 'DAMMv2→DLMM', sigs };
 }
 
+// ---------- Pool usability verification (read-only, no funds) ----------
+// After a candidate passes the price filter, we actually probe BOTH pools via the
+// official Meteora SDK (DLMM swapQuote / DAMMv2 getQuote). If a pool is dead
+// ("Pool price differs from estimated market price" / >5% away) the SDK throws —
+// we catch it and skip the candidate so we never try to trade a stale pool.
+async function verifyPoolUsable(route) {
+  if (!connection) await initRead(); // read-only: no wallet needed
+  try {
+    // Probe Leg-1 pool
+    if (route.buyOnDlmm) {
+      const dlmmPool = await DLMM.create(connection, new PublicKey(route.dlmmPool.raw.address), { cluster: 'mainnet-beta' });
+      const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT);
+      const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+      await dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays); // tiny amount, read-only
+    } else {
+      const cpAmm = new CpAmm(connection);
+      const ps = await cpAmm.fetchPoolState(new PublicKey(route.dammPool.raw.address));
+      await cpAmm.getQuote({
+        inAmount: new BN(1e6), inputTokenMint: new PublicKey(WSOL_MINT),
+        slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
+        currentTime: Math.floor(Date.now() / 1000), currentSlot: 0,
+        tokenADecimal: 9, tokenBDecimal: 9
+      });
+    }
+    // Probe Leg-2 pool
+    if (route.buyOnDlmm) {
+      const cpAmm = new CpAmm(connection);
+      const ps = await cpAmm.fetchPoolState(new PublicKey(route.dammPool.raw.address));
+      await cpAmm.getQuote({
+        inAmount: new BN(1e6), inputTokenMint: new PublicKey(route.tokenMint),
+        slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
+        currentTime: Math.floor(Date.now() / 1000), currentSlot: 0,
+        tokenADecimal: 9, tokenBDecimal: 9
+      });
+    } else {
+      const dlmmPool = await DLMM.create(connection, new PublicKey(route.dlmmPool.raw.address), { cluster: 'mainnet-beta' });
+      const swapForY = dlmmSwapForY(dlmmPool, route.tokenMint);
+      const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+      await dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays);
+    }
+    return { ok: true };
+  } catch (e) {
+    const msg = e?.message || String(e);
+    // SDK load failure (e.g. Node 22+ incompatibility) — surface clearly.
+    if (/Gagal load SDK|Node\.js 18\/20|not supported|Cannot find module|resolve ES modules/i.test(msg)) {
+      return { ok: false, reason: 'SDK load error (Node version?)', deadish: false, fatal: true };
+    }
+    // Meteora rejects swaps when pool price >5% from market — that's a dead pool.
+    const deadish = /price.*(differ|away|5%|market)|differs from|not tradable|no bin|empty/i.test(msg);
+    return { ok: false, reason: deadish ? 'dead pool (>5% from market)' : msg, deadish };
+  }
+}
+
 // ---------- Main loop ----------
 async function cycle() {
   const ts = new Date().toISOString();
@@ -461,8 +533,35 @@ async function cycle() {
     for (const c of candidates) {
       const startLamports = Math.floor(TRADE_AMOUNT_SOL * 1e9);
       const route = buildRoute(c, startLamports);
+
+      // Skip noise: pools whose base token is one of our quote/input tokens
+      // (e.g. SOL-USDT where the "token" is WSOL itself — an absurd route).
+      if (QUOTE_MINTS.has(route.tokenMint)) {
+        log(`\n   🎯 ${route.symbol} | mispricing ${c.mispricingPct.toFixed(2)}% | dir ${c.direction}`);
+        log(`      ⚪ base token is ${route.tokenMint.slice(0,6)} (SOL/USDC/USDT) — skip (not a real arb target)`);
+        continue;
+      }
+
       log(`\n   🎯 ${route.symbol} | mispricing ${c.mispricingPct.toFixed(2)}% | dir ${c.direction}`);
       log(`      Route: SOL→${route.tokenMint.slice(0,6)} (${route.leg1Venue}) → ${route.tokenMint.slice(0,6)} (${route.leg2Venue}) → USDC`);
+
+      // Verify both pools are actually usable (read-only SDK probe).
+      // Catches dead/stale pools that slipped past the 20% price filter.
+      if (process.env.RPC_URL) {
+        const v = await verifyPoolUsable(route);
+        if (!v.ok) {
+          if (v.fatal) {
+            warn(`      💥 ${v.reason} — live/probe tidak dapat berjalan. ${v.reason.includes('Node') ? 'Gunakan Node 18/20.' : ''}`);
+            if (MODE === 'live') { warn('      Menghentikan siklus live.'); break; }
+          } else {
+            warn(`      💀 pool unusable (${v.reason}) — skip`);
+          }
+          continue;
+        }
+        log(`      🔍 pool probe OK (both venues tradeable)`);
+      } else {
+        warn('      ⚠️ no RPC_URL set — skipping live pool probe (set RPC_URL to verify tradability)');
+      }
 
       if (MODE === 'dry-run') {
         const sim = await dryRun(route);
