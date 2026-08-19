@@ -3,13 +3,14 @@
 // Example:  node cross_match.js 100 1.0
 //
 // Features:
-//   - Dynamic mint/token scanning from Meteora DLMM + DAMM APIs
+//   - Dynamic mint/token scanning from Meteora DLMM + DAMM APIs (multi-page)
+//   - Dead pool detection (>20% deviation from Jupiter oracle = reject)
 //   - 5-second Jupiter price cache (fee-efficient)
 //   - Serialized logging (anti-garbled output)
-//   - Full error boundaries + retry logic
+//   - Configurable minTVL / minMispricingPct via CLI args
 
 import axios from 'axios';
-import { normalizePool, findCandidates } from './scanner.js';
+import { normalizePool, findCandidates, fetchAllPages } from './scanner.js';
 
 const DLMM_API    = 'https://dlmm.datapi.meteora.ag/pools';
 const DAMM_API    = 'https://damm-v2.datapi.meteora.ag/pools';
@@ -18,6 +19,7 @@ const JUPITER_PRICE_API = 'https://api.jup.ag/price/v3';
 const MIN_TVL        = parseFloat(process.argv[2] || "100");
 const MIN_MISPRICING = parseFloat(process.argv[3] || "1.0");
 const SCAN_INTERVAL_MS = 30000; // 30 seconds
+const MAX_PAGES = 5; // Scan up to 5 pages per venue (2500 pools each)
 
 // --- Serialized Logging (anti-garbled output) ---
 let logBuffer = [];
@@ -45,42 +47,19 @@ async function fetchTokenPrice(mint) {
 }
 
 /**
- * Fetch a page of pools from a Meteora API endpoint.
- * Returns the raw array of pool objects (un-normalized).
- */
-async function fetchPoolsFromAPI(apiName, url, pageSize = 500) {
-  log(`[${apiName}] Fetching ${pageSize} pools (sorted by TVL desc)...`);
-
-  try {
-    const resp = await axios.get(url, {
-      params: { page: 1, page_size: pageSize, sort_by: 'tvl:desc' },
-      timeout: 30000,
-      headers: { 'User-Agent': 'CrossMatchBot/1.0' }
-    });
-
-    const pools = resp.data?.data || resp.data || [];
-    log(`[${apiName}] Successfully fetched ${pools.length} pools`);
-    return pools;
-  } catch (err) {
-    log(`[${apiName}] ERROR: ${err.message}`);
-    return [];
-  }
-}
-
-/**
- * Main refresh cycle — fetch, normalize, cross-match, report.
+ * Main refresh cycle — fetch ALL pages, normalize, cross-match, report.
  */
 async function refresh() {
   const ts = new Date().toISOString();
   log(`\n${'='.repeat(60)}`);
   log(`[${ts}] 🔄 Starting scan cycle`);
-  log(`📊 Filters: minTVL=$${MIN_TVL}, minMispricing=${MIN_MISPRICING}%`);
+  log(`📊 Filters: minTVL=$${MIN_TVL}, minMispricing=${MIN_MISPRICING}%, maxPages=${MAX_PAGES}`);
 
-  // Step 1: Fetch pools from both venues in parallel
-  log(`\n📡 Fetching pools from Meteora DLMM + DAMM APIs...`);
+  // Step 1: Fetch ALL pages from both venues in parallel
+  log(`\n📡 Fetching ALL pools from Meteora DLMM (${MAX_PAGES} pages × 500) + DAMM (${MAX_PAGES} pages × 500)...`);
   const [dlmmRows, dammRows] = await Promise.all([
-    fetchPoolsFromAPI('DLMM', DLMM_API),
-    fetchPoolsFromAPI('DAMM', DAMM_API)
+    fetchAllPages('DLMM', DLMM_API, MAX_PAGES),
+    fetchAllPages('DAMM', DAMM_API, MAX_PAGES)
   ]);
 
   // Step 2: Normalize pools
@@ -152,7 +131,7 @@ async function refresh() {
 // --- Main Entry ---
 console.log('🚀 Cross Match Token Real Time — Starting...');
 console.log('   GitHub: https://github.com/Gfast416/cross-match-tool');
-console.log(`   Mode: Real-time arbitrage detection (interval: ${SCAN_INTERVAL_MS / 1000}s)`);
+console.log(`   Mode: Real-time arbitrage detection (interval: ${SCAN_INTERVAL_MS / 1000}s, pages: ${MAX_PAGES})`);
 
 async function start() {
   try {
