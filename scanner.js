@@ -425,11 +425,12 @@ function normalizePool(rows, type, minTvl = 100) {
 /**
  * Find arbitrage candidates between two pool venues.
  * Compares prices and calculates mispricing percentage.
+ * Filters out pools whose price is >30% away from Jupiter reference (dead/stale pool detection).
  * @param {Object} poolA - normalized pool from venue A
  * @param {Object} poolB - normalized pool from venue B
  * @param {number} jupiterPrice - reference price from Jupiter
  * @param {number} minMispricingPct - minimum mispricing percentage threshold
- * @returns {Object|null} candidate object or null if no mispricing
+ * @returns {Object|null} candidate object or null if no mispricing or pool appears stale
  */
 function findCandidates(poolA, poolB, jupiterPrice, minMispricingPct = 1.0) {
   if (!poolA || !poolB || !jupiterPrice || jupiterPrice <= 0) return null;
@@ -438,6 +439,23 @@ function findCandidates(poolA, poolB, jupiterPrice, minMispricingPct = 1.0) {
   const priceB = Number(poolB.priceUsd || 0);
 
   if (priceA <= 0 || priceB <= 0) return null;
+
+  // ⚠️ Dead pool filter: reject pools >20% away from oracle price
+  // This catches stale pools where liquidity migrated elsewhere
+  const threshold = jupiterPrice * 0.20;
+  const devA = Math.abs(priceA - jupiterPrice);
+  const devB = Math.abs(priceB - jupiterPrice);
+
+  if (devA > threshold || devB > threshold) {
+    // Log the dead pool detection for debugging
+    if (devA > threshold) {
+      console.warn(`[findCandidates] Rejecting DLMM pool ${poolA.tokenMint.slice(0,8)} - price ${priceA} deviates ${(devA/jupiterPrice*100).toFixed(1)}% from oracle ${jupiterPrice}`);
+    }
+    if (devB > threshold) {
+      console.warn(`[findCandidates] Rejecting DAMM pool ${poolB.tokenMint.slice(0,8)} - price ${priceB} deviates ${(devB/jupiterPrice*100).toFixed(1)}% from oracle ${jupiterPrice}`);
+    }
+    return null;
+  }
 
   // Calculate mispricing between venues
   const priceDiff = Math.abs(priceA - priceB);
