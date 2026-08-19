@@ -193,6 +193,7 @@ async function dryRun(route) {
 // ---------- LIVE execution (Meteora SDK + Helius low-fee strategy) ----------
 import {
   getOrCreateAssociatedTokenAccount, createSyncNativeInstruction,
+  createCloseAccountInstruction,
   NATIVE_MINT, TOKEN_PROGRAM_ID
 } from '@solana/spl-token';
 import { TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
@@ -271,6 +272,33 @@ async function prepareWsol(lamports) {
   return { ata, ixs };
 }
 
+// Close the WSOL ATA and recover its lamports back to SOL (only if balance ~0).
+async function closeWsol() {
+  try {
+    const ata = await getOrCreateAssociatedTokenAccount(
+      connection, wallet, NATIVE_MINT, wallet.publicKey
+    );
+    const info = await connection.getTokenAccountBalance(ata.address);
+    const bal = BigInt(info.value.amount);
+    if (bal > 0n) {
+      log('      ℹ️ WSOL balance > 0, skipping close (funds in use)');
+      return null;
+    }
+    const ix = createCloseAccountInstruction(
+      ata.address, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID
+    );
+    const tx = new Transaction().add(ix);
+    tx.feePayer = wallet.publicKey;
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx = await addFeeOptimization(tx, 150_000);
+    return await sendAndConfirm(tx, 'close WSOL');
+  } catch (e) {
+    warn('closeWsol failed (non-fatal):', e.message);
+    return null;
+  }
+}
+
 async function sendAndConfirm(tx, label) {
   const sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
   log(`      📨 ${label} sent: ${sig}`);
@@ -309,13 +337,25 @@ async function executeLive(route) {
     const dammAddr = new PublicKey(dammRaw.address);
     const cpAmm = new CpAmm(connection);
     const poolState = await cpAmm.fetchPoolState(dammAddr);
+    // tight minimum-out from a real DAMMv2 quote (anti-slippage)
+    const dammQuote2 = await cpAmm.getQuote({
+      inAmount: quote.outAmount,
+      inputTokenMint: tokenMint,
+      slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'),
+      poolState,
+      currentTime: Math.floor(Date.now() / 1000),
+      currentSlot: 0,
+      tokenADecimal: 9,
+      tokenBDecimal: 9,
+    });
+    const minOut2 = dammQuote2?.minSwapOutAmount || new BN(0);
     let tx2 = await cpAmm.swap({
       payer: wallet.publicKey,
       pool: dammAddr,
       inputTokenMint: tokenMint,
       outputTokenMint: new PublicKey(USDC_MINT),
       amountIn: quote.outAmount, // use actual received (minus fee), safe
-      minimumAmountOut: new BN(0),
+      minimumAmountOut: minOut2,
       tokenAMint: poolState.tokenAMint,
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
@@ -344,13 +384,14 @@ async function executeLive(route) {
       tokenADecimal: 9,
       tokenBDecimal: 9,
     });
+    const minOut1 = dammQuote?.minSwapOutAmount || new BN(0);
     let tx = await cpAmm.swap({
       payer: wallet.publicKey,
       pool: poolAddress,
       inputTokenMint: new PublicKey(WSOL_MINT),
       outputTokenMint: tokenMint,
       amountIn: new BN(lamports),
-      minimumAmountOut: new BN(0),
+      minimumAmountOut: minOut1,
       tokenAMint: poolState.tokenAMint,
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
@@ -383,7 +424,8 @@ async function executeLive(route) {
     });
     tx2 = await addFeeOptimization(tx2, 600_000);
     const sig2 = await sendAndConfirm(tx2, 'DLMM swap');
-    return { sent: true, venue: 'DAMMv2→DLMM', sigs: [sig1, sig2] };
+    const sig3 = await closeWsol(); // recover any leftover WSOL back to SOL
+    return { sent: true, venue: 'DAMMv2→DLMM', sigs: sig3 ? [sig1, sig2, sig3] : [sig1, sig2] };
   }
 }
 
