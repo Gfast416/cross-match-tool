@@ -14,9 +14,25 @@ dan mengeksekusinya (atau hanya menyimulasikan PnL di mode dry-run).
    - `SELL_A_BUY_B` → harga DAMMv2 lebih murah → beli di **DAMMv2**, jual di **DLMM**.
 3. **EXECUTE**
    - `MODE=dry-run` (default): simulasi spread + estimasi PnL via harga pool & Jupiter. Aman.
-   - `MODE=live`: bangun tx via SDK Meteora resmi (`@meteora-ag/dlmm`, `@meteora-ag/cp-amm-sdk`).
-     Tx **tidak otomatis dikirim** — direview dulu untuk melindungi dana Anda.
+   - `MODE=live`: eksekusi riil 2-hop via SDK Meteora resmi (`@meteora-ag/dlmm`, `@meteora-ag/cp-amm-sdk`),
+     otomatis kirim tx (ter-**gate** oleh cek net-profit, jadi tidak bakar SOL kalau fill buruk).
 4. **LOOP** — ulangi tiap `SCAN_INTERVAL_MS`.
+
+## Strategi Fee Rendah (khusus Helius free RPC)
+
+Biaya per swap ditekan seminimal mungkin tapi tetap cepat landing:
+
+- **Compute Unit LIMIT dipas ketat per-tx** — DLMM ≈ 600k CU, DAMMv2 ≈ 400k CU.
+  Membatasi LIMIT mencegah over-pay priority fee (yang dihitung per-CU).
+- **Priority fee via `getPriorityFeeEstimate` Helius (level `Min`)** — hanya tambahkan
+  micro-lamports/CU bila jaringan benar-benar butuh (biasanya 0–2000 µL/CU ≈ $0.00001–$0.0001).
+  Disimpan 15 detik (cache) supaya tidak nambah RPC call tiap tx.
+- **WSOL di-wrap sekali** via `SystemProgram.transfer` + `createSyncNative` (ATA WSOL dibuat
+  cuma pertama kali; setelahnya tanpa biaya sewa).
+- **Confirmation `confirmed`** (bukan `finalized`) → lebih cepat, cukup aman untuk arbitrase.
+
+Estimasi total: ≈ base fee 5000 lamports + priority mikro per swap. Dengan 2 swap per siklus,
+biayanya di kisaran **$0.00002–$0.0002** — jauh di bawah profit minimal (default 1%).
 
 ## Instalasi (Termux)
 

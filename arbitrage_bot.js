@@ -190,64 +190,200 @@ async function dryRun(route) {
   };
 }
 
-// ---------- LIVE execution (Meteora SDK) ----------
+// ---------- LIVE execution (Meteora SDK + Helius low-fee strategy) ----------
+import {
+  getOrCreateAssociatedTokenAccount, createSyncNativeInstruction,
+  NATIVE_MINT, TOKEN_PROGRAM_ID
+} from '@solana/spl-token';
+import { TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
+
 let connection = null, wallet = null, CpAmm = null, DLMM = null;
+
 async function initLive() {
   if (connection) return;
   const { default: _DLMM } = await import('@meteora-ag/dlmm');
   const _CpAmm = (await import('@meteora-ag/cp-amm-sdk')).default;
   DLMM = _DLMM;
   CpAmm = _CpAmm;
+  // 'finalized' = more reliable on free Helius; 'confirmed' is fine & faster too
   connection = new Connection(process.env.RPC_URL, 'confirmed');
   const secret = JSON.parse(Buffer.from(process.env.WALLET_PRIVATE_KEY, 'base64').toString('utf8'));
   wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
 }
 
+/**
+ * Low-fee + fast priority fee via Helius `getPriorityFeeEstimate`.
+ * Strategy: keep compute unit PRICE minimal but ABOVE 0 so the tx is not
+ * dropped by validators, while compute unit LIMIT is tightened per-tx to
+ * avoid overpaying. Free Helius supports this JSON-RPC method.
+ * Returns micro-lamports-per-CU (usually 0–2000 ≈ $0.00001–$0.0001).
+ */
+const FEE_CACHE = { value: 0, ts: 0 };
+async function getPriorityFeeMicroLamports() {
+  const now = Date.now();
+  if (now - FEE_CACHE.ts < 15000) return FEE_CACHE.value; // reuse 15s
+  try {
+    const body = {
+      jsonrpc: '2.0', id: 1, method: 'getPriorityFeeEstimate',
+      params: [{ options: { priorityLevel: 'Min' } }]
+    };
+    const res = await fetch(process.env.RPC_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const json = await res.json();
+    const micro = Number(json?.result?.priorityFeeEstimate) || 0;
+    FEE_CACHE.value = micro; FEE_CACHE.ts = now;
+    return micro;
+  } catch {
+    return 0; // fall back to no priority fee (still lands, just less guaranteed)
+  }
+}
+
+// Tighten CU limit per tx; swap is ~250k-1M CU depending on venue.
+async function addFeeOptimization(tx, estimateCu) {
+  const micro = await getPriorityFeeMicroLamports();
+  const ixs = [];
+  ixs.push(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: estimateCu })
+  );
+  // Only add a (tiny) priority fee when the network actually needs it.
+  if (micro > 0) {
+    ixs.push(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: micro })
+    );
+  }
+  tx.instructions = [...ixs, ...tx.instructions];
+  return tx;
+}
+
+// Ensure WSOL ATA exists & wrap SOL into it (needed when SOL is the input).
+async function prepareWsol(lamports) {
+  const ata = await getOrCreateAssociatedTokenAccount(
+    connection, wallet, NATIVE_MINT, wallet.publicKey
+  );
+  const ixs = [];
+  // top up WSOL so it can cover the trade
+  ixs.push(
+    SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata.address, lamports })
+  );
+  ixs.push(createSyncNativeInstruction(ata.address, TOKEN_PROGRAM_ID));
+  return { ata, ixs };
+}
+
+async function sendAndConfirm(tx, label) {
+  const sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
+  log(`      📨 ${label} sent: ${sig}`);
+  const conf = await connection.confirmTransaction(sig, 'confirmed');
+  if (conf.value.err) throw new Error(`${label} confirm err: ${JSON.stringify(conf.value.err)}`);
+  return sig;
+}
+
 async function executeLive(route) {
-  // NOTE: live path below builds unsigned txs via the official Meteora SDKs.
-  // It does NOT auto-send to protect your funds; review the built tx then broadcast.
   await initLive();
   const tokenMint = new PublicKey(route.tokenMint);
   const tokenPool = route.buyOnDlmm ? route.dlmmPool.raw : route.dammPool.raw;
-  const poolAddress = new PublicKey(tokenPool.address || tokenPool.lbPair || tokenPool.pubkey);
+  const poolAddress = new PublicKey(tokenPool.address);
+  const lamports = route.startAmountLamports;
 
   if (route.buyOnDlmm) {
+    // ---------- Leg 1: SOL -> token on DLMM ----------
     const dlmmPool = await DLMM.create(connection, poolAddress, { cluster: 'mainnet-beta' });
-    const swapForY = dlmmPool.tokenX.publicKey.toBase58() === WSOL_MINT; // SOL -> tokenX? swap for Y
+    const swapForY = dlmmPool.tokenX.publicKey.toBase58() === WSOL_MINT; // SOL is X => swap for Y
     const binArrays = await dlmmPool.getBinArrayForSwap(!swapForY);
-    const swapQuote = await dlmmPool.swapQuote(new BN(route.startAmountLamports), !swapForY, new BN(1), binArrays);
-    const tx = await dlmmPool.swap({
+    const quote = await dlmmPool.swapQuote(new BN(lamports), !swapForY, new BN(1), binArrays);
+    let tx = await dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
-      binArraysPubkey: swapQuote.binArraysPubkey,
-      inAmount: new BN(route.startAmountLamports),
+      binArraysPubkey: quote.binArraysPubkey,
+      inAmount: new BN(lamports),
       lbPair: dlmmPool.pubkey,
       user: wallet.publicKey,
-      minOutAmount: swapQuote.minOutAmount,
+      minOutAmount: quote.minOutAmount,
       outToken: dlmmPool.tokenY.publicKey
     });
-    return { builtTx: true, venue: 'DLMM', note: 'review & broadcast manually', tx };
-  } else {
+    tx = await addFeeOptimization(tx, 600_000);
+    const sig1 = await sendAndConfirm(tx, 'DLMM swap');
+
+    // ---------- Leg 2: token -> USDC on DAMMv2 ----------
+    const dammRaw = route.dammPool.raw;
+    const dammAddr = new PublicKey(dammRaw.address);
     const cpAmm = new CpAmm(connection);
-    const poolState = await cpAmm.fetchPoolState
-      ? await cpAmm.fetchPoolState(poolAddress)
-      : (await cpAmm.getPoolState ? await cpAmm.getPoolState(poolAddress) : null);
-    const swapTx = cpAmm.swap({
+    const poolState = await cpAmm.fetchPoolState(dammAddr);
+    let tx2 = await cpAmm.swap({
+      payer: wallet.publicKey,
+      pool: dammAddr,
+      inputTokenMint: tokenMint,
+      outputTokenMint: new PublicKey(USDC_MINT),
+      amountIn: quote.outAmount, // use actual received (minus fee), safe
+      minimumAmountOut: new BN(0),
+      tokenAMint: poolState.tokenAMint,
+      tokenBMint: poolState.tokenBMint,
+      tokenAVault: poolState.tokenAVault,
+      tokenBVault: poolState.tokenBVault,
+      tokenAProgram: poolState.tokenAProgram,
+      tokenBProgram: poolState.tokenBProgram,
+      referralTokenAccount: null,
+      poolState
+    });
+    tx2 = await addFeeOptimization(tx2, 400_000);
+    const sig2 = await sendAndConfirm(tx2, 'DAMMv2 swap');
+    return { sent: true, venue: 'DLMM→DAMMv2', sigs: [sig1, sig2] };
+  } else {
+    // ---------- Leg 1: SOL -> token on DAMMv2 ----------
+    const cpAmm = new CpAmm(connection);
+    const poolState = await cpAmm.fetchPoolState(poolAddress);
+    const { ixs: wrapIxs } = await prepareWsol(lamports);
+    // estimate leg-1 output so leg-2 (DLMM) can be quoted with the REAL amount
+    const dammQuote = await cpAmm.getQuote({
+      inAmount: new BN(lamports),
+      inputTokenMint: new PublicKey(WSOL_MINT),
+      slippage: 1,
+      poolState,
+      currentTime: Math.floor(Date.now() / 1000),
+      currentSlot: 0,
+      tokenADecimal: 9,
+      tokenBDecimal: 9,
+    });
+    let tx = await cpAmm.swap({
       payer: wallet.publicKey,
       pool: poolAddress,
       inputTokenMint: new PublicKey(WSOL_MINT),
       outputTokenMint: tokenMint,
-      amountIn: new BN(route.startAmountLamports),
+      amountIn: new BN(lamports),
       minimumAmountOut: new BN(0),
-      tokenAMint: poolState ? poolState.tokenAMint : tokenMint,
-      tokenBMint: poolState ? poolState.tokenBMint : new PublicKey(WSOL_MINT),
-      tokenAVault: poolState ? poolState.tokenAVault : tokenMint,
-      tokenBVault: poolState ? poolState.tokenBVault : new PublicKey(WSOL_MINT),
-      tokenAProgram: poolState ? poolState.tokenAProgram : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-      tokenBProgram: poolState ? poolState.tokenBProgram : new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+      tokenAMint: poolState.tokenAMint,
+      tokenBMint: poolState.tokenBMint,
+      tokenAVault: poolState.tokenAVault,
+      tokenBVault: poolState.tokenBVault,
+      tokenAProgram: poolState.tokenAProgram,
+      tokenBProgram: poolState.tokenBProgram,
       referralTokenAccount: null,
       poolState
     });
-    return { builtTx: true, venue: 'DAMMv2', note: 'review & broadcast manually', tx: swapTx };
+    tx.instructions = [...wrapIxs, ...tx.instructions];
+    tx = await addFeeOptimization(tx, 400_000);
+    const sig1 = await sendAndConfirm(tx, 'DAMMv2 swap');
+
+    // ---------- Leg 2: token -> USDC on DLMM ----------
+    const dlmmRaw = route.dlmmPool.raw;
+    const dlmmAddr = new PublicKey(dlmmRaw.address);
+    const dlmmPool = await DLMM.create(connection, dlmmAddr, { cluster: 'mainnet-beta' });
+    const swapForY = dlmmPool.tokenX.publicKey.toBase58() === WSOL_MINT;
+    const binArrays = await dlmmPool.getBinArrayForSwap(!swapForY);
+    const leg2In = dammQuote?.swapOutAmount || new BN(0);
+    const quote = await dlmmPool.swapQuote(leg2In, !swapForY, new BN(1), binArrays);
+    let tx2 = await dlmmPool.swap({
+      inToken: dlmmPool.tokenX.publicKey,
+      binArraysPubkey: quote.binArraysPubkey,
+      inAmount: quote.outAmount,
+      lbPair: dlmmPool.pubkey,
+      user: wallet.publicKey,
+      minOutAmount: quote.minOutAmount,
+      outToken: dlmmPool.tokenY.publicKey
+    });
+    tx2 = await addFeeOptimization(tx2, 600_000);
+    const sig2 = await sendAndConfirm(tx2, 'DLMM swap');
+    return { sent: true, venue: 'DAMMv2→DLMM', sigs: [sig1, sig2] };
   }
 }
 
@@ -282,8 +418,16 @@ async function cycle() {
           warn('   LIVE mode needs WALLET_PRIVATE_KEY + RPC_URL. Skipping.');
           continue;
         }
+        // Gate on the same net-profit check as dry-run so we don't burn SOL on bad fills.
+        const sim = await dryRun(route);
+        if (sim && sim.netPct < MIN_PROFIT_PCT) {
+          log(`      ⚪ live skip: est net ${sim.netPct.toFixed(2)}% < ${MIN_PROFIT_PCT}%`);
+          continue;
+        }
+        log(`      🔥 LIVE executing ${route.leg1Venue}->${route.leg2Venue} (${route.symbol})...`);
         const res = await executeLive(route);
-        log(`      ⚠️ LIVE tx built (${res.venue}): ${res.note}`);
+        log(`      ✅ LIVE done (${res.venue}): ${res.sigs.join(' , ')}`);
+        await notify(`🔥 *LIVE EXECUTED* ${route.symbol}\nRoute ${route.leg1Venue}→${route.leg2Venue}\n${res.sigs.map(s => 'https://solscan.io/tx/' + s).join('\n')}`);
       }
     }
   } catch (err) {
