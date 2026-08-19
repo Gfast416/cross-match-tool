@@ -12,7 +12,11 @@
     "test": "node --check scanner.js && node --check cross_match.js && node --check deploy.js && node --check verify.js"
   },
   "dependencies": {
+    "@meteora-ag/cp-amm-sdk": "^1.4.6",
+    "@meteora-ag/dlmm": "^1.9.14",
+    "@solana/web3.js": "^1.98.4",
     "axios": "^1.19.0",
+    "bn.js": "^5.2.5",
     "dotenv": "^16.6.1"
   },
   "engines": {
