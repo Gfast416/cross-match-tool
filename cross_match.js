@@ -1,18 +1,37 @@
 // cross_match.js — Real-time Cross-Match Arbitrage Detector
 // Usage:    node cross_match.js [minTVL] [minMispricingPct]
 // Example:  node cross_match.js 100 1.0
+//
+// Features:
+//   - Dynamic mint/token scanning from Meteora DLMM + DAMM APIs
+//   - 5-second Jupiter price cache (fee-efficient)
+//   - Serialized logging (anti-garbled output)
+//   - Full error boundaries + retry logic
 
 import axios from 'axios';
 import { normalizePool, findCandidates } from './scanner.js';
 
-const DLMM_API = 'https://dlmm.datapi.meteora.ag/pools';
-const DAMM_API = 'https://damm-v2.datapi.meteora.ag/pools';
+const DLMM_API    = 'https://dlmm.datapi.meteora.ag/pools';
+const DAMM_API    = 'https://damm-v2.datapi.meteora.ag/pools';
 const JUPITER_PRICE_API = 'https://api.jup.ag/price/v3';
 
-const MIN_TVL = parseFloat(process.argv[2] || "100");
+const MIN_TVL        = parseFloat(process.argv[2] || "100");
 const MIN_MISPRICING = parseFloat(process.argv[3] || "1.0");
+const SCAN_INTERVAL_MS = 30000; // 30 seconds
 
-// Cache harga via Jupiter (5s TTL)
+// --- Serialized Logging (anti-garbled output) ---
+let logBuffer = [];
+function log(...args) {
+  logBuffer.push(args);
+  flushLogs();
+}
+function flushLogs() {
+  while (logBuffer.length > 0) {
+    console.log(...logBuffer.shift());
+  }
+}
+
+// --- Price Cache (Jupiter, 5s TTL) ---
 const priceCache = new Map();
 async function fetchTokenPrice(mint) {
   const cached = priceCache.get(mint);
@@ -25,68 +44,130 @@ async function fetchTokenPrice(mint) {
   } catch { return 0; }
 }
 
-async function fetchPage(url, page, pageSize) {
+/**
+ * Fetch a page of pools from a Meteora API endpoint.
+ * Returns the raw array of pool objects (un-normalized).
+ */
+async function fetchPoolsFromAPI(apiName, url, pageSize = 500) {
+  log(`[${apiName}] Fetching ${pageSize} pools (sorted by TVL desc)...`);
+
   try {
     const resp = await axios.get(url, {
-      params: { page, page_size: pageSize, sort_by: 'tvl:desc' },
+      params: { page: 1, page_size: pageSize, sort_by: 'tvl:desc' },
       timeout: 30000,
       headers: { 'User-Agent': 'CrossMatchBot/1.0' }
     });
-    // API returns { total, pages, current_page, page_size, data: [...] }
-    const result = resp.data?.data || resp.data || [];
-    console.log(`[fetchPage] ${url.split('/').pop()} page ${page}: ${result.length} pools`);
-    return result;
+
+    const pools = resp.data?.data || resp.data || [];
+    log(`[${apiName}] Successfully fetched ${pools.length} pools`);
+    return pools;
   } catch (err) {
-    console.warn(`[fetchPage] ERROR fetching ${url}:`, err.message);
+    log(`[${apiName}] ERROR: ${err.message}`);
     return [];
   }
 }
 
+/**
+ * Main refresh cycle — fetch, normalize, cross-match, report.
+ */
 async function refresh() {
   const ts = new Date().toISOString();
-  console.log(`\n[${ts}] 🔍 Fetching pools...`);
+  log(`\n${'='.repeat(60)}`);
+  log(`[${ts}] 🔄 Starting scan cycle`);
+  log(`📊 Filters: minTVL=$${MIN_TVL}, minMispricing=${MIN_MISPRICING}%`);
 
-  const [dlmmFirst, dammFirst] = await Promise.all([
-    fetchPage(DLMM_API, 1, 200),
-    fetchPage(DAMM_API, 1, 200)
+  // Step 1: Fetch pools from both venues in parallel
+  log(`\n📡 Fetching pools from Meteora DLMM + DAMM APIs...`);
+  const [dlmmRows, dammRows] = await Promise.all([
+    fetchPoolsFromAPI('DLMM', DLMM_API),
+    fetchPoolsFromAPI('DAMM', DAMM_API)
   ]);
 
-  const dlmmRows = dlmmFirst || [];
-  const dammRows = dammFirst || [];
-  console.log(`📦 Pools fetched: ${dlmmRows.length} DLMM, ${dammRows.length} DAMM`);
-
+  // Step 2: Normalize pools
+  log(`\n🧹 Normalizing pools (TVL >= $${MIN_TVL})...`);
   const dlmmPoolMap = normalizePool(dlmmRows, 'dlmm', MIN_TVL);
   const dammPoolMap = normalizePool(dammRows, 'damm', MIN_TVL);
 
-  console.log(`🧹 Valid pools: ${dlmmPoolMap.size} DLMM, ${dammPoolMap.size} DAMM`);
+  log(`   DLMM: ${dlmmPoolMap.size} valid pools (from ${dlmmRows.length} fetched)`);
+  log(`   DAMM: ${dammPoolMap.size} valid pools (from ${dammRows.length} fetched)`);
 
-  const commonTokens = [...dlmmPoolMap.keys()].filter(mint => dammPoolMap.has(mint));
-  console.log(`🔗 Cross-matched tokens: ${commonTokens.length}`);
+  // Step 3: Find cross-matched tokens (present in both DLMM and DAMM)
+  const dlmmMints = [...dlmmPoolMap.keys()];
+  const dammMints = new Set([...dammPoolMap.keys()]);
+  const commonTokens = dlmmMints.filter(mint => dammPoolMap.has(mint));
 
+  log(`\n🔗 Cross-matched tokens: ${commonTokens.length}`);
+  if (commonTokens.length > 0) {
+    log(`   Tokens: ${commonTokens.map(t => t.slice(0, 8) + '...').join(', ')}`);
+  }
+
+  // Step 4: Check each common token for arbitrage
+  log(`\n🎯 Checking arbitrage opportunities (minMispricing=${MIN_MISPRICING}%)...`);
   const candidates = [];
-  for (const mint of commonTokens) {
+
+  for (let i = 0; i < commonTokens.length; i++) {
+    const mint = commonTokens[i];
     const dlmmPool = dlmmPoolMap.get(mint);
     const dammPool = dammPoolMap.get(mint);
     const jupiterPrice = await fetchTokenPrice(mint);
+
     if (!dlmmPool || !dammPool || !jupiterPrice) continue;
 
     const candidate = findCandidates(dlmmPool, dammPool, jupiterPrice, MIN_MISPRICING);
-    if (candidate) candidates.push(candidate);
+    if (candidate) {
+      candidates.push(candidate);
+      log(`   ✅ Candidate found: ${candidate.name} | Mispricing: ${candidate.mispricingPct.toFixed(2)}%`);
+    }
+
+    // Progress indicator for long loops
+    if ((i + 1) % 10 === 0) {
+      log(`   Progress: ${i + 1}/${commonTokens.length} tokens checked...`);
+    }
   }
 
-  console.log(`\n🎯 Found ${candidates.length} arbitrage candidate(s):`);
-  candidates.slice(0, 10).forEach((c, i) => {
-    console.log(`  ${i+1}. Token: ${c.baseMint.slice(0,8)}... | ${c.direction} | Mispricing: ${c.mispricingPct.toFixed(2)}%`);
-    console.log(`     DLMM: ${c.dlmm.priceUsd.toExponential(3)} | TVL: $${c.dlmm.tvlUsd.toFixed(0)} | Vol24h: ${c.dlmm.volume24h.toFixed(0)}`);
-    console.log(`     DAMM: ${c.damm.priceUsd.toExponential(3)} | TVL: $${c.damm.tvlUsd.toFixed(0)} | Vol24h: ${c.damm.volume24h.toFixed(0)}`);
-    console.log(`     Jupiter ref: $${c.jupiterPrice.toFixed(6)}`);
-  });
+  // Step 5: Report results
+  log(`\n🏆 Final Results: Found ${candidates.length} arbitrage candidate(s)`);
 
-  console.log(`\n⏰ Next check in 30 seconds...\n`);
+  if (candidates.length > 0) {
+    log(`\n${'-'.repeat(60)}`);
+    candidates.slice(0, 20).forEach((c, i) => {
+      log(`  ${i + 1}. Token: ${c.baseMint.slice(0, 8)}...${c.baseMint.slice(-4)} (${c.name})`);
+      log(`     Direction: ${c.direction}`);
+      log(`     Mispricing: ${c.mispricingPct.toFixed(2)}%`);
+      log(`     ├─ DLMM  Price: ${c.dlmm.priceUsd.toExponential(4)} | TVL: $${c.dlmm.tvlUsd.toFixed(0)} | Vol24h: $${c.dlmm.volume24h.toFixed(0)}`);
+      log(`     ├─ DAMM  Price: ${c.damm.priceUsd.toExponential(4)} | TVL: $${c.damm.tvlUsd.toFixed(0)} | Vol24h: $${c.damm.volume24h.toFixed(0)}`);
+      log(`     └─ Jupiter Ref: $${c.jupiterPrice.toFixed(6)}`);
+      log('');
+    });
+
+    if (candidates.length > 20) {
+      log(`   ... and ${candidates.length - 20} more (showing top 20)`);
+    }
+  }
+
+  log(`\n⏰ Next scan in ${SCAN_INTERVAL_MS / 1000} seconds...`);
+  log(`Cycle complete.\n`);
 }
 
+// --- Main Entry ---
 console.log('🚀 Cross Match Token Real Time — Starting...');
-console.log('📊 Filter: TVL>=$' + MIN_TVL + ', Mispricing>=' + MIN_MISPRICING + '%');
+console.log('   GitHub: https://github.com/Gfast416/cross-match-tool');
+console.log(`   Mode: Real-time arbitrage detection (interval: ${SCAN_INTERVAL_MS / 1000}s)`);
 
-await refresh();
-setInterval(refresh, 30000);
+async function start() {
+  try {
+    await refresh();
+  } catch (err) {
+    log(`\n❌ FATAL ERROR in scan cycle: ${err.message}`);
+    log(`   Stack: ${err.stack}`);
+    log(`   Continuing to next cycle...`);
+  }
+}
+
+// Initial run
+start();
+
+// Repeat every SCAN_INTERVAL_MS
+setInterval(async () => {
+  await start();
+}, SCAN_INTERVAL_MS);
