@@ -435,8 +435,8 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: poolState.tokenAProgram,
-      tokenBProgram: poolState.tokenBProgram,
+      tokenAProgram: poolState.tokenAProgram || TOKEN_PROGRAM_ID,
+      tokenBProgram: poolState.tokenBProgram || TOKEN_PROGRAM_ID,
       referralTokenAccount: null,
       poolState
     });
@@ -469,8 +469,8 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: poolState.tokenAProgram,
-      tokenBProgram: poolState.tokenBProgram,
+      tokenAProgram: poolState.tokenAProgram || TOKEN_PROGRAM_ID,
+      tokenBProgram: poolState.tokenBProgram || TOKEN_PROGRAM_ID,
       referralTokenAccount: null,
       poolState
     });
