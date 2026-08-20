@@ -227,8 +227,46 @@ async function initLive() {
   // connection+SDK may already be set by initRead() (pool probe); only (re)set wallet here.
   if (!connection) await initRead();
   if (!wallet) {
-    const secret = JSON.parse(Buffer.from(process.env.WALLET_PRIVATE_KEY, 'base64').toString('utf8'));
-    wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
+    const raw = process.env.WALLET_PRIVATE_KEY.trim();
+    let secretBytes;
+    try {
+      // Format 1: base64 of a JSON array of bytes  (e.g. from `Buffer.from(JSON.stringify([...])).toString('base64')`)
+      const decoded = Buffer.from(raw, 'base64').toString('utf8');
+      const arr = JSON.parse(decoded);
+      if (Array.isArray(arr) && arr.length === 64) {
+        secretBytes = Uint8Array.from(arr);
+      } else {
+        throw new Error('not an array');
+      }
+    } catch {
+      try {
+        // Format 2: a JSON array pasted directly as text  (e.g. [1,2,3,...])
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length === 64) {
+          secretBytes = Uint8Array.from(arr);
+        } else {
+          throw new Error('not an array');
+        }
+      } catch {
+        // Format 3: base58 secret key (Solflare / solana-keygen / Phantom export)
+        try {
+          const bs58 = (await import('bs58')).default;
+          secretBytes = bs58.decode(raw);
+        } catch (e) {
+          throw new Error(
+            'WALLET_PRIVATE_KEY tidak dikenali. Gunakan salah satu:\n' +
+            '  (a) base64 dari JSON array byte (lihat .env.bot.example), atau\n' +
+            '  (b) base58 secret key (Solflare/phantom), atau\n' +
+            '  (c) JSON array [..] langsung.\n' +
+            'Error decode: ' + e.message
+          );
+        }
+      }
+    }
+    if (!secretBytes || secretBytes.length !== 64) {
+      throw new Error('WALLET_PRIVATE_KEY harus menghasilkan 64 byte (array/base58).');
+    }
+    wallet = Keypair.fromSecretKey(secretBytes);
   }
 }
 
