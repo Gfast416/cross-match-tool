@@ -368,7 +368,15 @@ async function ensureAta(mint) {
 }
 
 async function sendAndConfirm(tx, label) {
-  const sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
+  let sig;
+  try {
+    sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
+  } catch (e) {
+    // SendTransactionError carries .logs with the real revert reason.
+    let msg = e?.message || String(e);
+    if (e?.logs && Array.isArray(e.logs)) msg += '\nLogs:\n' + e.logs.join('\n');
+    throw new Error(`${label} send failed: ${msg}`);
+  }
   log(`      📨 ${label} sent: ${sig}`);
   const conf = await connection.confirmTransaction(sig, 'confirmed');
   if (conf.value.err) throw new Error(`${label} confirm err: ${JSON.stringify(conf.value.err)}`);
@@ -644,7 +652,11 @@ async function cycle() {
       }
     }
   } catch (err) {
-    warn('scan cycle error:', err.message);
+    // Surface the FULL error: message, SDK logs, and stack.
+    let detail = err?.message || String(err);
+    if (err?.logs && Array.isArray(err.logs)) detail += '\nLogs:\n' + err.logs.join('\n');
+    if (err?.stack) detail += '\nStack: ' + err.stack.split('\n').slice(0, 4).join('\n');
+    warn('scan cycle error:', detail);
   }
 }
 
