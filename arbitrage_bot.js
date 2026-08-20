@@ -204,7 +204,7 @@ import {
   NATIVE_MINT, TOKEN_PROGRAM_ID
 } from '@solana/spl-token';
 
-let connection = null, wallet = null, CpAmm = null, DLMM = null;
+let connection = null, wallet = null, CpAmm = null, DLMM = null, getTokenProgram = null;
 
 async function initRead() {
   if (connection) return;
@@ -213,6 +213,7 @@ async function initRead() {
     const cpAmmMod = await import('@meteora-ag/cp-amm-sdk');
     DLMM = dlmmMod.default || dlmmMod.DLMM;
     CpAmm = cpAmmMod.CpAmm || cpAmmMod.default?.CpAmm || cpAmmMod.default;
+    getTokenProgram = cpAmmMod.getTokenProgram || (() => TOKEN_PROGRAM_ID);
     connection = new Connection(process.env.RPC_URL, 'confirmed');
   } catch (e) {
     throw new Error(
@@ -318,17 +319,29 @@ async function addFeeOptimization(tx, estimateCu) {
 }
 
 // Ensure WSOL ATA exists & wrap SOL into it (needed when SOL is the input).
+// SDK swaps create the WSOL ATA themselves, but they do NOT wrap native SOL —
+// so we do the wrap in a separate, self-contained tx BEFORE the swap.
 async function prepareWsol(lamports) {
-  const ata = await getOrCreateAssociatedTokenAccount(
-    connection, wallet, NATIVE_MINT, wallet.publicKey
-  );
+  const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
   const ixs = [];
-  // top up WSOL so it can cover the trade
+  // idempotent: create the WSOL ATA only if missing
+  try {
+    await getAccount(connection, ata);
+  } catch {
+    ixs.push(createAssociatedTokenAccountInstruction(
+      wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, TOKEN_PROGRAM_ID
+    ));
+  }
   ixs.push(
-    SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata.address, lamports })
+    SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports })
   );
-  ixs.push(createSyncNativeInstruction(ata.address, TOKEN_PROGRAM_ID));
-  return { ata, ixs };
+  ixs.push(createSyncNativeInstruction(ata, TOKEN_PROGRAM_ID));
+  const tx = new Transaction().add(...ixs);
+  tx.feePayer = wallet.publicKey;
+  const { blockhash } = await connection.getLatestBlockhash('confirmed');
+  tx.recentBlockhash = blockhash;
+  const optimized = await addFeeOptimization(tx, 200_000);
+  return await sendAndConfirm(optimized, 'wrap SOL->WSOL');
 }
 
 // Close the WSOL ATA and recover its lamports back to SOL (only if it exists & balance ~0).
@@ -358,32 +371,6 @@ async function closeWsol() {
   } catch (e) {
     warn('closeWsol failed (non-fatal):', e.message);
     return null;
-  }
-}
-
-// Ensure the wallet has an Associated Token Account for `mint` (creates it if missing).
-// DAMMv2/DLMM swaps fail with "Account not associated with this Mint" if the
-// output ATA does not exist yet. Uses getAssociatedTokenAddress + explicit create
-// (getOrCreateAssociatedTokenAccount throws TokenAccountNotFoundError on this spl-token version).
-async function ensureAta(mint) {
-  const mintPub = new PublicKey(mint); // accepts string or PublicKey
-  const mintStr = mintPub.toBase58();
-  const ata = await getAssociatedTokenAddress(mintPub, wallet.publicKey);
-  try {
-    await getAccount(connection, ata);
-    return ata; // already exists
-  } catch {
-    // not found -> create it
-    const ix = createAssociatedTokenAccountInstruction(
-      wallet.publicKey, ata, wallet.publicKey, mintPub, TOKEN_PROGRAM_ID
-    );
-    let tx = new Transaction().add(ix);
-    tx.feePayer = wallet.publicKey;
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-    tx.recentBlockhash = blockhash;
-    tx = await addFeeOptimization(tx, 150_000);
-    await sendAndConfirm(tx, `create ATA ${mintStr.slice(0, 4)}`);
-    return ata;
   }
 }
 
@@ -422,8 +409,8 @@ async function executeLive(route) {
   const poolAddress = new PublicKey(tokenPool.address);
   const lamports = route.startAmountLamports;
 
-  // DLMM/DAMMv2 only accept WSOL, not native SOL — wrap once up front.
-  const { ixs: wrapIxs } = await prepareWsol(lamports);
+  // DLMM/DAMMv2 only accept WSOL, not native SOL — wrap once up front (separate tx).
+  await prepareWsol(lamports);
 
   let sigs = [];
   if (route.buyOnDlmm) {
@@ -441,7 +428,6 @@ async function executeLive(route) {
       minOutAmount: quote.minOutAmount,
       outToken: dlmmPool.tokenY.publicKey
     });
-    tx.instructions = [...wrapIxs, ...tx.instructions]; // wrap SOL->WSOL first
     tx = await addFeeOptimization(tx, 600_000);
     const sig1 = await sendAndConfirm(tx, 'DLMM swap');
     sigs.push(sig1);
@@ -462,7 +448,6 @@ async function executeLive(route) {
       tokenBDecimal: 9,
     });
     const minOut2 = dammQuote2?.minSwapOutAmount || new BN(0);
-    await ensureAta(USDC_MINT); // output ATA for DAMMv2 leg
     let tx2 = await cpAmm.swap({
       payer: wallet.publicKey,
       pool: dammAddr,
@@ -474,8 +459,8 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: poolState.tokenAProgram || TOKEN_PROGRAM_ID,
-      tokenBProgram: poolState.tokenBProgram || TOKEN_PROGRAM_ID,
+      tokenAProgram: getTokenProgram(poolState.tokenAFlag),
+      tokenBProgram: getTokenProgram(poolState.tokenBFlag),
       referralTokenAccount: null,
       poolState
     });
@@ -497,8 +482,6 @@ async function executeLive(route) {
       tokenBDecimal: 9,
     });
     const minOut1 = dammQuote?.minSwapOutAmount || new BN(0);
-    await ensureAta(tokenMint);      // output ATA for DAMMv2 leg (SOL->token)
-    await ensureAta(USDC_MINT);     // output ATA for DLMM leg 2 (token->USDC)
     let tx = await cpAmm.swap({
       payer: wallet.publicKey,
       pool: poolAddress,
@@ -510,12 +493,11 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: poolState.tokenAProgram || TOKEN_PROGRAM_ID,
-      tokenBProgram: poolState.tokenBProgram || TOKEN_PROGRAM_ID,
+      tokenAProgram: getTokenProgram(poolState.tokenAFlag),
+      tokenBProgram: getTokenProgram(poolState.tokenBFlag),
       referralTokenAccount: null,
       poolState
     });
-    tx.instructions = [...wrapIxs, ...tx.instructions];
     tx = await addFeeOptimization(tx, 400_000);
     const sig1 = await sendAndConfirm(tx, 'DAMMv2 swap');
     sigs.push(sig1);
