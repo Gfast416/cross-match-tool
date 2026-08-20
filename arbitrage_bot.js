@@ -498,8 +498,6 @@ async function executeLive(route) {
   const tokenMint = new PublicKey(route.tokenMint);
   const lamports = route.startAmountLamports;
 
-  // DLMM/DAMMv2 only accept WSOL, not native SOL — wrap once up front (separate tx).
-  await prepareWsol(lamports);
   // Pre-create the leg-1 OUTPUT token ATA (separate tx) so the swap's own
   // getOrCreateATAInstruction finds an already-initialized account.
   await ensureAtaSeparate(tokenMint);
@@ -507,6 +505,8 @@ async function executeLive(route) {
   let sigs = [];
   // ---------- Leg 1: SOL (WSOL) -> token (on the pool that contains WSOL) ----------
   if (route.leg1IsDlmm) {
+    // DLMM does NOT wrap SOL itself — wrap WSOL manually in a separate tx first.
+    await prepareWsol(lamports);
     const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
     const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
@@ -529,7 +529,7 @@ async function executeLive(route) {
     const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address)), 20000, 'fetchPoolState leg1');
     const dammQuote = await withTimeout(cpAmm.getQuote({
       inAmount: new BN(lamports),
-      inputTokenMint: new PublicKey(WSOL_MINT),
+      inputTokenMint: NATIVE_MINT,
       slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'),
       poolState,
       currentTime: Math.floor(Date.now() / 1000),
@@ -545,7 +545,7 @@ async function executeLive(route) {
     let tx = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg1Pool.raw.address),
-      inputTokenMint: new PublicKey(WSOL_MINT),
+      inputTokenMint: NATIVE_MINT,
       outputTokenMint: tokenMint,
       amountIn: new BN(lamports),
       minimumAmountOut: minOut1,
