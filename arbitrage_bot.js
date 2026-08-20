@@ -162,6 +162,13 @@ function buildRoute(candidate, startAmountLamports) {
   const leg1IsDlmm = dlmmHasWsol;
   const leg2IsDlmm = dlmmHasUsdc;
 
+  // No valid route if NEITHER venue has a WSOL pool for this token — SOL can't enter.
+  // (e.g. USWS only has USDC pairs in both DLMM & DAMMv2). Skip this candidate.
+  if (!dlmmHasWsol && !dammHasWsol) {
+    log(`      ⚠️ no WSOL pool for ${symbol} in either venue — cannot route SOL in — skip`);
+    return null;
+  }
+
   const symbol = dlmmRaw?.name || dammRaw?.name || tokenMint.slice(0, 6);
   return {
     tokenMint,
@@ -698,6 +705,7 @@ async function cycle() {
     for (const c of candidates) {
       const startLamports = Math.floor(TRADE_AMOUNT_SOL * 1e9);
       const route = buildRoute(c, startLamports);
+      if (!route) continue; // no valid WSOL-entry route (e.g. token has no WSOL pool)
 
       // Skip noise: pools whose base token is one of our quote/input tokens
       // (e.g. SOL-USDT where the "token" is WSOL itself — an absurd route).
