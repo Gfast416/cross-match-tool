@@ -35,6 +35,8 @@ const RAYDIUM_API = 'https://api.raydium.io/v2/main/pools';
 const ORCA_API = 'https://api.orca.so/v2/whirlpools';
 const METEORA_API = 'https://api.meteora.io/v1/pools';
 const JUPITER_PRICE_API = 'https://price.jup.ag/v4/price';
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 // --- GitHub Headers ---
 function ghHeaders() {
@@ -446,7 +448,7 @@ function normalizePool(rows, type, minTvl = 100) {
       // Only include pools with sufficient TVL, some 24h volume, and valid data.
       // volume24h > 0 filters out dead/illiquid pools (no trading activity).
       if (tokenMint && priceUsd > 0 && tvlUsd >= minTvl && volume24h > 0) {
-        poolMap.set(tokenMint, {
+        const neu = {
           venue: type,
           tokenMint,
           priceUsd,
@@ -455,7 +457,27 @@ function normalizePool(rows, type, minTvl = 100) {
           reserve0: Number(row.reserve0 || row.token_x_amount || 0),
           reserve1: Number(row.reserve1 || row.token_y_amount || 0),
           raw: row
-        });
+        };
+        const hasTok = (r, m) => {
+          const xs = r?.token_x?.address || r?.tokenX?.address || r?.token_a_mint || '';
+          const ys = r?.token_y?.address || r?.tokenY?.address || r?.token_b_mint || '';
+          return xs === m || ys === m;
+        };
+        // If the same mint appears in multiple pools (e.g. WSOL-MET and USDC-MET),
+        // keep the one we need for routing: DLMM prefers WSOL (SOL-side), DAMMv2 prefers USDC.
+        if (!poolMap.has(tokenMint)) {
+          poolMap.set(tokenMint, neu);
+        } else {
+          const ex = poolMap.get(tokenMint);
+          const exW = hasTok(ex.raw, WSOL_MINT);
+          const newW = hasTok(row, WSOL_MINT);
+          const exU = hasTok(ex.raw, USDC_MINT);
+          const newU = hasTok(row, USDC_MINT);
+          let replace = false;
+          if (type === 'dlmm') replace = (!exW && newW) || (exW === newW && tvlUsd > ex.tvlUsd);
+          else replace = (!exU && newU) || (exU === newU && tvlUsd > ex.tvlUsd);
+          if (replace) poolMap.set(tokenMint, neu);
+        }
       }
     } catch (err) {
       // Skip malformed entries
