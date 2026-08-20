@@ -199,7 +199,7 @@ async function dryRun(route) {
 // ---------- LIVE execution (Meteora SDK + Helius low-fee strategy) ----------
 import {
   getOrCreateAssociatedTokenAccount, createSyncNativeInstruction,
-  createCloseAccountInstruction,
+  createCloseAccountInstruction, getAssociatedTokenAddress,
   NATIVE_MINT, TOKEN_PROGRAM_ID
 } from '@solana/spl-token';
 
@@ -330,20 +330,23 @@ async function prepareWsol(lamports) {
   return { ata, ixs };
 }
 
-// Close the WSOL ATA and recover its lamports back to SOL (only if balance ~0).
+// Close the WSOL ATA and recover its lamports back to SOL (only if it exists & balance ~0).
 async function closeWsol() {
   try {
-    const ata = await getOrCreateAssociatedTokenAccount(
-      connection, wallet, NATIVE_MINT, wallet.publicKey
-    );
-    const info = await connection.getTokenAccountBalance(ata.address);
+    const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
+    let info;
+    try {
+      info = await connection.getTokenAccountBalance(ata);
+    } catch {
+      return null; // WSOL ATA doesn't exist — nothing to close
+    }
     const bal = BigInt(info.value.amount);
     if (bal > 0n) {
       log('      ℹ️ WSOL balance > 0, skipping close (funds in use)');
       return null;
     }
     const ix = createCloseAccountInstruction(
-      ata.address, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID
+      ata, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID
     );
     const tx = new Transaction().add(ix);
     tx.feePayer = wallet.publicKey;
