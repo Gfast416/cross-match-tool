@@ -22,6 +22,23 @@
 import axios from 'axios';
 import fs from 'fs';
 
+// Quiet mode by default: suppress per-page / per-pool noise. Set DEBUG=1 to see everything.
+const DEBUG = process.env.DEBUG === '1';
+if (!DEBUG) {
+  const _log = console.log.bind(console);
+  console.log = (...a) => {
+    const s = a.map(String).join(' ');
+    if (/(Page \d|fetched|Fetching up to|Total pools|skipping malformed|starting dynamic scan|Layer \d|total pairs|repo |done —|created repo|already exists|opportunities found)/.test(s)) return;
+    _log(...a);
+  };
+  const _warn = console.warn.bind(console);
+  console.warn = (...a) => {
+    const s = a.map(String).join(' ');
+    if (/(Rejecting|retry|Page .* failed|no jupiter|batch failed|normalizePool)/.test(s)) return;
+    _warn(...a);
+  };
+}
+
 // Config
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const OWNER = 'Gfast416';

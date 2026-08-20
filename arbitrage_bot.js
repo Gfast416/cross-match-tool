@@ -100,6 +100,8 @@ function errorDetail(err, ctx) {
   return parts.join('\n');
 }
 function fail(ctx, err) { warn(errorDetail(err, ctx)); }
+// Debug-only line (set DEBUG=1 to see routing/SDK internals).
+function dbg(...args) { if (process.env.DEBUG === '1') log('      🔬', ...args); }
 
 // ---------- Price cache (Jupiter, 5s) ----------
 const priceCache = new Map();
@@ -173,7 +175,7 @@ function buildRoute(candidate, startAmountLamports) {
   const dammHasWsol = has(dammRaw, WSOL_MINT);
   const dlmmHasUsdc = has(dlmmRaw, USDC_MINT);
   const dammHasUsdc = has(dammRaw, USDC_MINT);
-  log(`      [debug route] dlmmRaw.token_x=${dlmmRaw?.token_x?.address||dlmmRaw?.tokenX?.address} token_y=${dlmmRaw?.token_y?.address||dlmmRaw?.tokenY?.address} dlmmHasWsol=${dlmmHasWsol} dammHasWsol=${dammHasWsol} dlmmHasUsdc=${dlmmHasUsdc} dammHasUsdc=${dammHasUsdc}`);
+  dbg(`route dlmmRaw.token_x=${dlmmRaw?.token_x?.address||dlmmRaw?.tokenX?.address} token_y=${dlmmRaw?.token_y?.address||dlmmRaw?.tokenY?.address} dlmmHasWsol=${dlmmHasWsol} dammHasWsol=${dammHasWsol} dlmmHasUsdc=${dlmmHasUsdc} dammHasUsdc=${dammHasUsdc}`);
 
   const leg1Pool = dlmmHasWsol ? candidate.dlmmPool : candidate.dammPool; // SOL side
   const leg2Pool = dlmmHasUsdc ? candidate.dlmmPool : candidate.dammPool; // USDC side
@@ -565,7 +567,7 @@ async function executeLive(route) {
     // Resolve token program: prefer on-chain poolState.tokenAProgram, else read mint owner (SPL vs Token-2022).
     const taProg = poolState.tokenAProgram || await getMintProgram(poolState.tokenAMint);
     const tbProg = poolState.tokenBProgram || await getMintProgram(poolState.tokenBMint);
-    log(`      [debug leg1] tokenAMint=${poolState.tokenAMint} tokenAFlag=${poolState.tokenAFlag} onChainProg=${poolState.tokenAProgram && poolState.tokenAProgram} ownerA=${taProg.toBase58()}`);
+    dbg(`leg1 tokenAMint=${poolState.tokenAMint} tokenAFlag=${poolState.tokenAFlag} onChainProg=${poolState.tokenAProgram && poolState.tokenAProgram} ownerA=${taProg.toBase58()}`);
     let tx = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg1Pool.raw.address),
