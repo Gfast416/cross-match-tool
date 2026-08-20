@@ -52,7 +52,7 @@ const JUPITER_PRICE_API = 'https://api.jup.ag/price/v3';
 const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/quote';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
-const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wO3tyqV94nY8t';
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 // Tokens we use as quote/input — never treat a pool whose base is one of these as an arb target.
 const QUOTE_MINTS = new Set([WSOL_MINT, USDC_MINT, USDT_MINT]);
