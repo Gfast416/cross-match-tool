@@ -199,7 +199,8 @@ async function dryRun(route) {
 // ---------- LIVE execution (Meteora SDK + Helius low-fee strategy) ----------
 import {
   getOrCreateAssociatedTokenAccount, createSyncNativeInstruction,
-  createCloseAccountInstruction, getAssociatedTokenAddress,
+  createCloseAccountInstruction, getAssociatedTokenAddress, getAccount,
+  createAssociatedTokenAccountInstruction,
   NATIVE_MINT, TOKEN_PROGRAM_ID
 } from '@solana/spl-token';
 
@@ -362,12 +363,26 @@ async function closeWsol() {
 
 // Ensure the wallet has an Associated Token Account for `mint` (creates it if missing).
 // DAMMv2/DLMM swaps fail with "Account not associated with this Mint" if the
-// output ATA does not exist yet.
+// output ATA does not exist yet. Uses getAssociatedTokenAddress + explicit create
+// (getOrCreateAssociatedTokenAccount throws TokenAccountNotFoundError on this spl-token version).
 async function ensureAta(mint) {
-  const ata = await getOrCreateAssociatedTokenAccount(
-    connection, wallet, new PublicKey(mint), wallet.publicKey
-  );
-  return ata.address;
+  const ata = await getAssociatedTokenAddress(new PublicKey(mint), wallet.publicKey);
+  try {
+    await getAccount(connection, ata);
+    return ata; // already exists
+  } catch {
+    // not found -> create it
+    const ix = createAssociatedTokenAccountInstruction(
+      wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), TOKEN_PROGRAM_ID
+    );
+    const tx = new Transaction().add(ix);
+    tx.feePayer = wallet.publicKey;
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx = await addFeeOptimization(tx, 150_000);
+    await sendAndConfirm(tx, `create ATA ${mint.slice(0, 4)}`);
+    return ata;
+  }
 }
 
 async function sendAndConfirm(tx, label) {
