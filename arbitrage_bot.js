@@ -441,6 +441,18 @@ function dlmmSlippageBps() {
   return new BN(Math.max(1, Math.round((parseFloat(process.env.SLIPPAGE_PCT || '1.0')) * 100)));
 }
 
+// Resolve the SPL vs Token-2022 program for a mint by reading its on-chain
+// owner. This is the ONLY fully-reliable way — poolState.tokenAFlag can be
+// wrong/missing, and a wrong program makes the SDK create the ATA under the
+// wrong program => "Account not associated with this Mint" on swap.
+async function getMintProgram(mint) {
+  try {
+    const info = await withTimeout(connection.getAccountInfo(new PublicKey(mint)), 20000, 'getAccountInfo mint');
+    if (info && info.owner) return info.owner; // PublicKey of the token program
+  } catch { /* fall through */ }
+  return TOKEN_PROGRAM_ID;
+}
+
 async function executeLive(route) {
   await initLive();
   const tokenMint = new PublicKey(route.tokenMint);
@@ -494,8 +506,8 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: getTokenProgram(poolState.tokenAFlag),
-      tokenBProgram: getTokenProgram(poolState.tokenBFlag),
+      tokenAProgram: await getMintProgram(poolState.tokenAMint),
+      tokenBProgram: await getMintProgram(poolState.tokenBMint),
       referralTokenAccount: null,
       poolState
     }), 25000, 'CpAmm.swap leg1');
@@ -548,8 +560,8 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: getTokenProgram(poolState.tokenAFlag),
-      tokenBProgram: getTokenProgram(poolState.tokenBFlag),
+      tokenAProgram: await getMintProgram(poolState.tokenAMint),
+      tokenBProgram: await getMintProgram(poolState.tokenBMint),
       referralTokenAccount: null,
       poolState
     }), 25000, 'CpAmm.swap leg2');
