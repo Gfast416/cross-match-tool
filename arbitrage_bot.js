@@ -413,6 +413,28 @@ async function closeWsol() {
   }
 }
 
+// Create the output token's ATA in its OWN tx (separate from the swap) if missing.
+// The Meteora SDK's getOrCreateATAInstruction only does CreateIdempotent — for some
+// mints the ATA is created but NOT initialized, so the subsequent swap fails with
+// "Account not associated with this Mint". Pre-creating it here (own sendAndConfirm,
+// never prepended to the swap tx) guarantees an initialized ATA before the swap.
+async function ensureAtaSeparate(mint) {
+  const ata = await getAssociatedTokenAddress(new PublicKey(mint), wallet.publicKey);
+  const info = await withTimeout(connection.getAccountInfo(ata), 20000, 'getAccountInfo ATA');
+  if (info && info.data) return ata; // already exists & initialized
+  const prog = await getMintProgram(mint);
+  const ix = createAssociatedTokenAccountInstruction(
+    wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), prog
+  );
+  let tx = new Transaction().add(ix);
+  tx.feePayer = wallet.publicKey;
+  const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash ata');
+  tx.recentBlockhash = blockhash;
+  tx = await addFeeOptimization(tx, 120_000);
+  await sendAndConfirm(tx, `create ATA ${new PublicKey(mint).toBase58().slice(0, 6)}`);
+  return ata;
+}
+
 async function sendAndConfirm(tx, label) {
   let sig;
   try {
@@ -460,6 +482,9 @@ async function executeLive(route) {
 
   // DLMM/DAMMv2 only accept WSOL, not native SOL — wrap once up front (separate tx).
   await prepareWsol(lamports);
+  // Pre-create the leg-1 OUTPUT token ATA (separate tx) so the swap's own
+  // getOrCreateATAInstruction finds an already-initialized account.
+  await ensureAtaSeparate(tokenMint);
 
   let sigs = [];
   // ---------- Leg 1: SOL (WSOL) -> token (on the pool that contains WSOL) ----------
@@ -522,6 +547,8 @@ async function executeLive(route) {
   }
 
   // ---------- Leg 2: token -> USDC (on the pool that contains USDC) ----------
+  // Pre-create the USDC output ATA (separate tx) so the swap finds it initialized.
+  await ensureAtaSeparate(USDC_MINT);
   if (route.leg2IsDlmm) {
     const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
     const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token
