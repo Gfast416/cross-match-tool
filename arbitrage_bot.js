@@ -120,26 +120,40 @@ async function scanForCandidates() {
 }
 
 // ---------- Build 2-hop route (DLMM -> DAMMv2) ----------
-// Direction from findCandidates:
-//   BUY_A_SELL_B  => priceA <= priceB  => buy on A (DLMM, cheaper), sell on B (DAMMv2, pricier)
-//   SELL_A_BUY_B  => priceA >  priceB  => buy on B (DAMMv2, cheaper), sell on A (DLMM, pricier)
+// Leg 1 must be the pool that contains WSOL (SOL side): SOL -> token.
+// Leg 2 must be the pool that contains USDC: token -> USDC.
+// The venue (DLMM vs DAMMv2) for each leg is chosen by which pool holds WSOL/USDC,
+// NOT by price direction — otherwise we'd swap WSOL into a USDC-quoted pool (bad mint).
 function buildRoute(candidate, startAmountLamports) {
-  const buyOnDlmm = candidate.direction === 'BUY_A_SELL_B';
   const tokenMint = candidate.baseMint;
-  // prefer a human-readable symbol from the raw pool if present
-  const symbol = candidate.dlmmPool?.raw?.name
-    || candidate.dammPool?.raw?.name
-    || candidate.baseMint.slice(0, 6);
+  const dlmmRaw = candidate.dlmmPool.raw;
+  const dammRaw = candidate.dammPool.raw;
+  const has = (raw, mint) => {
+    const xs = raw?.token_x?.address || raw?.tokenX?.address || raw?.token_a_mint || '';
+    const ys = raw?.token_y?.address || raw?.tokenY?.address || raw?.token_b_mint || '';
+    return xs === mint || ys === mint;
+  };
+  const dlmmHasWsol = has(dlmmRaw, WSOL_MINT);
+  const dammHasWsol = has(dammRaw, WSOL_MINT);
+  const dlmmHasUsdc = has(dlmmRaw, USDC_MINT);
+  const dammHasUsdc = has(dammRaw, USDC_MINT);
+
+  const leg1Pool = dlmmHasWsol ? candidate.dlmmPool : candidate.dammPool; // SOL side
+  const leg2Pool = dlmmHasUsdc ? candidate.dlmmPool : candidate.dammPool; // USDC side
+  const leg1IsDlmm = dlmmHasWsol;
+  const leg2IsDlmm = dlmmHasUsdc;
+
+  const symbol = dlmmRaw?.name || dammRaw?.name || tokenMint.slice(0, 6);
   return {
     tokenMint,
-    buyOnDlmm,
-    // Leg 1: SOL -> token  (on the cheaper venue)
-    leg1Venue: buyOnDlmm ? 'DLMM' : 'DAMMv2',
-    leg1Pool: buyOnDlmm ? candidate.dlmmPool : candidate.dammPool,
-    // Leg 2: token -> USDC (on the pricier venue)
-    leg2Venue: buyOnDlmm ? 'DAMMv2' : 'DLMM',
-    leg2Pool: buyOnDlmm ? candidate.dammPool : candidate.dlmmPool,
-    // keep refs to both normalized pools for PnL estimation
+    // keep direction for PnL/profit logging (buy cheaper venue, sell pricier)
+    buyOnDlmm: candidate.direction === 'BUY_A_SELL_B',
+    leg1Venue: leg1IsDlmm ? 'DLMM' : 'DAMMv2',
+    leg1Pool,
+    leg2Venue: leg2IsDlmm ? 'DLMM' : 'DAMMv2',
+    leg2Pool,
+    leg1IsDlmm,
+    leg2IsDlmm,
     dlmmPool: candidate.dlmmPool,
     dammPool: candidate.dammPool,
     symbol,
@@ -405,18 +419,16 @@ function dlmmSlippageBps() {
 async function executeLive(route) {
   await initLive();
   const tokenMint = new PublicKey(route.tokenMint);
-  const tokenPool = route.buyOnDlmm ? route.dlmmPool.raw : route.dammPool.raw;
-  const poolAddress = new PublicKey(tokenPool.address);
   const lamports = route.startAmountLamports;
 
   // DLMM/DAMMv2 only accept WSOL, not native SOL — wrap once up front (separate tx).
   await prepareWsol(lamports);
 
   let sigs = [];
-  if (route.buyOnDlmm) {
-    // ---------- Leg 1: SOL -> token on DLMM ----------
-    const dlmmPool = await DLMM.create(connection, poolAddress, { cluster: 'mainnet-beta' });
-    const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL (X or Y?)
+  // ---------- Leg 1: SOL (WSOL) -> token (on the pool that contains WSOL) ----------
+  if (route.leg1IsDlmm) {
+    const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' });
+    const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL
     const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
     const quote = await dlmmPool.swapQuote(new BN(lamports), swapForY, dlmmSlippageBps(), binArrays);
     let tx = await dlmmPool.swap({
@@ -429,48 +441,12 @@ async function executeLive(route) {
       outToken: dlmmPool.tokenY.publicKey
     });
     tx = await addFeeOptimization(tx, 600_000);
-    const sig1 = await sendAndConfirm(tx, 'DLMM swap');
+    const sig1 = await sendAndConfirm(tx, 'DLMM swap (leg1)');
     sigs.push(sig1);
-
-    // ---------- Leg 2: token -> USDC on DAMMv2 ----------
-    const dammRaw = route.dammPool.raw;
-    const dammAddr = new PublicKey(dammRaw.address);
-    const cpAmm = new CpAmm(connection);
-    const poolState = await cpAmm.fetchPoolState(dammAddr);
-    const dammQuote2 = await cpAmm.getQuote({
-      inAmount: quote.outAmount,
-      inputTokenMint: tokenMint,
-      slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'),
-      poolState,
-      currentTime: Math.floor(Date.now() / 1000),
-      currentSlot: 0,
-      tokenADecimal: 9,
-      tokenBDecimal: 9,
-    });
-    const minOut2 = dammQuote2?.minSwapOutAmount || new BN(0);
-    let tx2 = await cpAmm.swap({
-      payer: wallet.publicKey,
-      pool: dammAddr,
-      inputTokenMint: tokenMint,
-      outputTokenMint: new PublicKey(USDC_MINT),
-      amountIn: quote.outAmount,
-      minimumAmountOut: minOut2,
-      tokenAMint: poolState.tokenAMint,
-      tokenBMint: poolState.tokenBMint,
-      tokenAVault: poolState.tokenAVault,
-      tokenBVault: poolState.tokenBVault,
-      tokenAProgram: getTokenProgram(poolState.tokenAFlag),
-      tokenBProgram: getTokenProgram(poolState.tokenBFlag),
-      referralTokenAccount: null,
-      poolState
-    });
-    tx2 = await addFeeOptimization(tx2, 400_000);
-    const sig2 = await sendAndConfirm(tx2, 'DAMMv2 swap');
-    sigs.push(sig2);
+    var leg1OutAmount = quote.outAmount;
   } else {
-    // ---------- Leg 1: SOL -> token on DAMMv2 ----------
     const cpAmm = new CpAmm(connection);
-    const poolState = await cpAmm.fetchPoolState(poolAddress);
+    const poolState = await cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address));
     const dammQuote = await cpAmm.getQuote({
       inAmount: new BN(lamports),
       inputTokenMint: new PublicKey(WSOL_MINT),
@@ -484,7 +460,7 @@ async function executeLive(route) {
     const minOut1 = dammQuote?.minSwapOutAmount || new BN(0);
     let tx = await cpAmm.swap({
       payer: wallet.publicKey,
-      pool: poolAddress,
+      pool: new PublicKey(route.leg1Pool.raw.address),
       inputTokenMint: new PublicKey(WSOL_MINT),
       outputTokenMint: tokenMint,
       amountIn: new BN(lamports),
@@ -499,17 +475,17 @@ async function executeLive(route) {
       poolState
     });
     tx = await addFeeOptimization(tx, 400_000);
-    const sig1 = await sendAndConfirm(tx, 'DAMMv2 swap');
+    const sig1 = await sendAndConfirm(tx, 'DAMMv2 swap (leg1)');
     sigs.push(sig1);
+    var leg1OutAmount = dammQuote?.swapOutAmount || new BN(0);
+  }
 
-    // ---------- Leg 2: token -> USDC on DLMM ----------
-    const dlmmRaw = route.dlmmPool.raw;
-    const dlmmAddr = new PublicKey(dlmmRaw.address);
-    const dlmmPool = await DLMM.create(connection, dlmmAddr, { cluster: 'mainnet-beta' });
-    const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token (not SOL)
+  // ---------- Leg 2: token -> USDC (on the pool that contains USDC) ----------
+  if (route.leg2IsDlmm) {
+    const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' });
+    const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token
     const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
-    const leg2In = dammQuote?.swapOutAmount || new BN(0);
-    const quote = await dlmmPool.swapQuote(leg2In, swapForY, dlmmSlippageBps(), binArrays);
+    const quote = await dlmmPool.swapQuote(leg1OutAmount, swapForY, dlmmSlippageBps(), binArrays);
     let tx2 = await dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
@@ -520,14 +496,47 @@ async function executeLive(route) {
       outToken: dlmmPool.tokenY.publicKey
     });
     tx2 = await addFeeOptimization(tx2, 600_000);
-    const sig2 = await sendAndConfirm(tx2, 'DLMM swap');
+    const sig2 = await sendAndConfirm(tx2, 'DLMM swap (leg2)');
+    sigs.push(sig2);
+  } else {
+    const cpAmm = new CpAmm(connection);
+    const poolState = await cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address));
+    const dammQuote2 = await cpAmm.getQuote({
+      inAmount: leg1OutAmount,
+      inputTokenMint: tokenMint,
+      slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'),
+      poolState,
+      currentTime: Math.floor(Date.now() / 1000),
+      currentSlot: 0,
+      tokenADecimal: 9,
+      tokenBDecimal: 9,
+    });
+    const minOut2 = dammQuote2?.minSwapOutAmount || new BN(0);
+    let tx2 = await cpAmm.swap({
+      payer: wallet.publicKey,
+      pool: new PublicKey(route.leg2Pool.raw.address),
+      inputTokenMint: tokenMint,
+      outputTokenMint: new PublicKey(USDC_MINT),
+      amountIn: leg1OutAmount,
+      minimumAmountOut: minOut2,
+      tokenAMint: poolState.tokenAMint,
+      tokenBMint: poolState.tokenBMint,
+      tokenAVault: poolState.tokenAVault,
+      tokenBVault: poolState.tokenBVault,
+      tokenAProgram: getTokenProgram(poolState.tokenAFlag),
+      tokenBProgram: getTokenProgram(poolState.tokenBFlag),
+      referralTokenAccount: null,
+      poolState
+    });
+    tx2 = await addFeeOptimization(tx2, 400_000);
+    const sig2 = await sendAndConfirm(tx2, 'DAMMv2 swap (leg2)');
     sigs.push(sig2);
   }
 
   // Recover any leftover WSOL back to SOL (non-fatal).
   const sig3 = await closeWsol();
   if (sig3) sigs.push(sig3);
-  return { sent: true, venue: route.buyOnDlmm ? 'DLMM→DAMMv2' : 'DAMMv2→DLMM', sigs };
+  return { sent: true, venue: `${route.leg1Venue}→${route.leg2Venue}`, sigs };
 }
 
 // ---------- Pool usability verification (read-only, no funds) ----------
@@ -538,15 +547,15 @@ async function executeLive(route) {
 async function verifyPoolUsable(route) {
   if (!connection) await initRead(); // read-only: no wallet needed
   try {
-    // Probe Leg-1 pool
-    if (route.buyOnDlmm) {
-      const dlmmPool = await DLMM.create(connection, new PublicKey(route.dlmmPool.raw.address), { cluster: 'mainnet-beta' });
+    // Probe Leg-1 pool (SOL/WSOL side)
+    if (route.leg1IsDlmm) {
+      const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' });
       const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT);
       const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
       await dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays); // tiny amount, read-only
     } else {
       const cpAmm = new CpAmm(connection);
-      const ps = await cpAmm.fetchPoolState(new PublicKey(route.dammPool.raw.address));
+      const ps = await cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address));
       await cpAmm.getQuote({
         inAmount: new BN(1e6), inputTokenMint: new PublicKey(WSOL_MINT),
         slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
@@ -554,21 +563,21 @@ async function verifyPoolUsable(route) {
         tokenADecimal: 9, tokenBDecimal: 9
       });
     }
-    // Probe Leg-2 pool
-    if (route.buyOnDlmm) {
+    // Probe Leg-2 pool (USDC side)
+    if (route.leg2IsDlmm) {
+      const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' });
+      const swapForY = dlmmSwapForY(dlmmPool, route.tokenMint);
+      const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+      await dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays);
+    } else {
       const cpAmm = new CpAmm(connection);
-      const ps = await cpAmm.fetchPoolState(new PublicKey(route.dammPool.raw.address));
+      const ps = await cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address));
       await cpAmm.getQuote({
         inAmount: new BN(1e6), inputTokenMint: new PublicKey(route.tokenMint),
         slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
         currentTime: Math.floor(Date.now() / 1000), currentSlot: 0,
         tokenADecimal: 9, tokenBDecimal: 9
       });
-    } else {
-      const dlmmPool = await DLMM.create(connection, new PublicKey(route.dlmmPool.raw.address), { cluster: 'mainnet-beta' });
-      const swapForY = dlmmSwapForY(dlmmPool, route.tokenMint);
-      const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
-      await dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays);
     }
     return { ok: true };
   } catch (e) {
