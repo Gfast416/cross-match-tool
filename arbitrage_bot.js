@@ -76,12 +76,30 @@ const QUOTE_MINTS = new Set([WSOL_MINT, USDC_MINT, USDT_MINT]);
 const DEAD_POOL_PCT = parseFloat(process.env.DEAD_POOL_PCT || '5.0');
 
 // ---------- Serialized logging ----------
+// log = normal step, warn = soft warning, fail = full error detail (always verbose).
 const logBuffer = [];
+function ts() { return new Date().toISOString(); }
 function log(...args) {
-  logBuffer.push(args);
-  while (logBuffer.length) console.log(...logBuffer.shift());
+  logBuffer.push(`[${ts()}] ${args.map(String).join(' ')}`);
+  while (logBuffer.length) console.log(logBuffer.shift());
 }
-function warn(...args) { console.warn('[!]', ...args); }
+function warn(...args) { console.warn(`[${ts()}] [!] ${args.map(String).join(' ')}`); }
+
+// Always surface the FULL error: message + on-chain simulator logs + short stack.
+// This is used in every catch block so no failure is ever swallowed silently.
+function errorDetail(err, ctx) {
+  const parts = [];
+  if (ctx) parts.push(`[${ctx}]`);
+  parts.push(err?.message || String(err));
+  if (err?.logs && Array.isArray(err.logs) && err.logs.length) {
+    parts.push('Logs:\n' + err.logs.join('\n'));
+  }
+  if (err?.stack) {
+    parts.push('Stack: ' + err.stack.split('\n').slice(0, 5).join('\n'));
+  }
+  return parts.join('\n');
+}
+function fail(ctx, err) { warn(errorDetail(err, ctx)); }
 
 // ---------- Price cache (Jupiter, 5s) ----------
 const priceCache = new Map();
@@ -467,9 +485,7 @@ async function sendAndConfirm(tx, label) {
     sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
   } catch (e) {
     // SendTransactionError carries .logs with the real revert reason.
-    let msg = e?.message || String(e);
-    if (e?.logs && Array.isArray(e.logs)) msg += '\nLogs:\n' + e.logs.join('\n');
-    throw new Error(`${label} send failed: ${msg}`);
+    throw new Error(`${label} send failed: ${errorDetail(e)}`);
   }
   log(`      📨 ${label} sent: ${sig}`);
   const conf = await withTimeout(connection.confirmTransaction(sig, 'confirmed'), 30000, `${label} confirm`);
@@ -688,6 +704,7 @@ async function verifyPoolUsable(route) {
     }
     // Meteora rejects swaps when pool price >5% from market — that's a dead pool.
     const deadish = /price.*(differ|away|5%|market)|differs from|not tradable|no bin|empty/i.test(msg);
+    if (!deadish) fail('pool probe', e);
     return { ok: false, reason: deadish ? 'dead pool (>5% from market)' : msg, deadish };
   }
 }
@@ -778,11 +795,8 @@ async function cycle() {
       }
     }
   } catch (err) {
-    // Surface the FULL error: message, SDK logs, and stack.
-    let detail = err?.message || String(err);
-    if (err?.logs && Array.isArray(err.logs)) detail += '\nLogs:\n' + err.logs.join('\n');
-    if (err?.stack) detail += '\nStack: ' + err.stack.split('\n').slice(0, 4).join('\n');
-    warn('scan cycle error:', detail);
+    // Surface the FULL error: message, SDK logs, and stack — never swallow.
+    fail('scan cycle', err);
   }
 }
 
