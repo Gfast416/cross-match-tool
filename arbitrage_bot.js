@@ -233,7 +233,7 @@ import {
   getOrCreateAssociatedTokenAccount, createSyncNativeInstruction,
   createCloseAccountInstruction, getAssociatedTokenAddress, getAccount,
   createAssociatedTokenAccountInstruction,
-  NATIVE_MINT, TOKEN_PROGRAM_ID
+  NATIVE_MINT, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
 } from '@solana/spl-token';
 
 let connection = null, wallet = null, CpAmm = null, DLMM = null, getTokenProgram = null;
@@ -360,25 +360,36 @@ async function addFeeOptimization(tx, estimateCu) {
 // Ensure WSOL ATA exists & wrap SOL into it (needed when SOL is the input).
 // SDK swaps create the WSOL ATA themselves, but they do NOT wrap native SOL —
 // so we do the wrap in a separate, self-contained tx BEFORE the swap.
+// IMPORTANT: if a stale/corrupt WSOL ATA exists under the WRONG token program
+// (e.g. Token-2022 from an earlier run), we must close+recreate it as SPL first,
+// otherwise every swap fails with "Account not associated with this Mint" / "IllegalOwner".
 async function prepareWsol(lamports) {
   const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
-  const ixs = [];
-  // idempotent: create the WSOL ATA only if missing
+  const SPL = TOKEN_PROGRAM_ID;
+  // 1) If a WSOL ATA already exists, close it (recover lamports) so we can recreate cleanly.
+  let existing;
   try {
-    await withTimeout(getAccount(connection, ata), RPC_TIMEOUT_MS, 'getAccount WSOL ATA');
-  } catch {
-    ixs.push(createAssociatedTokenAccountInstruction(
-      wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, TOKEN_PROGRAM_ID
-    ));
+    existing = await withTimeout(connection.getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA');
+  } catch { existing = null; }
+  if (existing && existing.data) {
+    const ownerProg = existing.owner; // program that currently owns the ATA
+    const closeIx = createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], ownerProg);
+    const closeTx = new Transaction().add(closeIx);
+    closeTx.feePayer = wallet.publicKey;
+    const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash close-wsol');
+    closeTx.recentBlockhash = blockhash;
+    await sendAndConfirm(await addFeeOptimization(closeTx, 120_000), 'close stale WSOL ATA');
   }
-  ixs.push(
-    SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports })
-  );
-  ixs.push(createSyncNativeInstruction(ata, TOKEN_PROGRAM_ID));
+  // 2) Recreate WSOL ATA as SPL, then wrap.
+  const ixs = [
+    createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, SPL),
+    SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports }),
+    createSyncNativeInstruction(ata, SPL)
+  ];
   const tx = new Transaction().add(...ixs);
   tx.feePayer = wallet.publicKey;
-  const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash');
-  tx.recentBlockhash = blockhash;
+  const { blockhash: bh2 } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash');
+  tx.recentBlockhash = bh2;
   const optimized = await addFeeOptimization(tx, 200_000);
   return await sendAndConfirm(optimized, 'wrap SOL->WSOL');
 }
@@ -389,17 +400,24 @@ async function closeWsol() {
     const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
     let info;
     try {
-      info = await withTimeout(connection.getTokenAccountBalance(ata), RPC_TIMEOUT_MS, 'getTokenAccountBalance');
+      info = await withTimeout(connection.getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA close');
     } catch {
       return null; // WSOL ATA doesn't exist — nothing to close
     }
-    const bal = BigInt(info.value.amount);
+    if (!info || !info.data) return null;
+    const balRaw = info.data && info.value ? info.value.lamports : 0; // not used; balance checked below
+    // balance check via token account
+    let bal = 0n;
+    try {
+      const tb = await withTimeout(connection.getTokenAccountBalance(ata), RPC_TIMEOUT_MS, 'getTokenAccountBalance');
+      bal = BigInt(tb.value.amount);
+    } catch { bal = 0n; }
     if (bal > 0n) {
       log('      ℹ️ WSOL balance > 0, skipping close (funds in use)');
       return null;
     }
     const ix = createCloseAccountInstruction(
-      ata, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID
+      ata, wallet.publicKey, wallet.publicKey, [], info.owner // close with the ATA's actual owner program
     );
     let tx = new Transaction().add(ix);
     tx.feePayer = wallet.publicKey;
