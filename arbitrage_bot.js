@@ -366,21 +366,23 @@ async function closeWsol() {
 // output ATA does not exist yet. Uses getAssociatedTokenAddress + explicit create
 // (getOrCreateAssociatedTokenAccount throws TokenAccountNotFoundError on this spl-token version).
 async function ensureAta(mint) {
-  const ata = await getAssociatedTokenAddress(new PublicKey(mint), wallet.publicKey);
+  const mintPub = new PublicKey(mint); // accepts string or PublicKey
+  const mintStr = mintPub.toBase58();
+  const ata = await getAssociatedTokenAddress(mintPub, wallet.publicKey);
   try {
     await getAccount(connection, ata);
     return ata; // already exists
   } catch {
     // not found -> create it
     const ix = createAssociatedTokenAccountInstruction(
-      wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), TOKEN_PROGRAM_ID
+      wallet.publicKey, ata, wallet.publicKey, mintPub, TOKEN_PROGRAM_ID
     );
     let tx = new Transaction().add(ix);
     tx.feePayer = wallet.publicKey;
     const { blockhash } = await connection.getLatestBlockhash('confirmed');
     tx.recentBlockhash = blockhash;
     tx = await addFeeOptimization(tx, 150_000);
-    await sendAndConfirm(tx, `create ATA ${mint.slice(0, 4)}`);
+    await sendAndConfirm(tx, `create ATA ${mintStr.slice(0, 4)}`);
     return ata;
   }
 }
