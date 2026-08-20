@@ -128,12 +128,22 @@ Estimasi total per siklus (2 swap): **~$0.00002–$0.0002** — jauh di bawah pr
 
 ### ⚠️ Requirement Node.js untuk Mode Live
 
-SDK Meteora (`@meteora-ag/dlmm`, `@meteora-ag/cp-amm-sdk`) butuh **Node.js 18 atau 20 (LTS)**.
-Di **Node 22+ (termasuk 26)**, SDK gagal load karena isu kompatibilitas ESM↔CJS
+SDK Meteora (`@meteora-ag/dlmm`, `@meteora-ag/cp-amm-sdk`) butuh **Node.js 18/20** secara
+native. Di **Node 22+ (termasuk 26)**, SDK gagal load karena isu kompatibilitas ESM↔CJS
 (`@coral-xyz/anchor`) — bot akan menampilkan pesan instruktif, bukan crash.
 
-- Termux: `pkg install nodejs` (biasanya Node 18/20) → live mode jalan normal.
-- Jika memaksa Node 26: jalankan **tanpa `RPC_URL`** (dry-run aman) atau turunkan Node.
+**Solusi untuk Node 22+ (Termux default sekarang = Node 26):**
+```bash
+npm install
+bash fix_node26.sh        # patch anchor CJS agar bisa di-load di Node 22+
+node arbitrage_bot.js 100 0.5
+```
+`fix_node26.sh` hanya memodifikasi `node_modules` (tidak di-push). Jalankan ulang
+setiap kali `npm install` dilakukan.
+
+- Termux `pkg install nodejs` → Node 26 → **butuh `fix_node26.sh`**.
+- Jika punya Node 18/20 → langsung jalan tanpa patch.
+- Jika memaksa tanpa patch di Node 22+: jalankan **tanpa `RPC_URL`** (dry-run aman).
 
 ### Penyaringan Kandidat (noise & dead pool)
 

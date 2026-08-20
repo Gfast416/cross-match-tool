@@ -208,16 +208,16 @@ let connection = null, wallet = null, CpAmm = null, DLMM = null;
 async function initRead() {
   if (connection) return;
   try {
-    const { default: _DLMM } = await import('@meteora-ag/dlmm');
-    const _CpAmm = (await import('@meteora-ag/cp-amm-sdk')).default;
-    DLMM = _DLMM;
-    CpAmm = _CpAmm;
+    const dlmmMod = await import('@meteora-ag/dlmm');
+    const cpAmmMod = await import('@meteora-ag/cp-amm-sdk');
+    DLMM = dlmmMod.default || dlmmMod.DLMM;
+    CpAmm = cpAmmMod.CpAmm || cpAmmMod.default?.CpAmm || cpAmmMod.default;
     connection = new Connection(process.env.RPC_URL, 'confirmed');
   } catch (e) {
     throw new Error(
       `Gagal load SDK Meteora (${e.message.split('\n')[0]}).\n` +
-      `Live/probe butuh Node.js 18/20. Node 22+ (termasuk 26) belum kompatibel dgn SDK Meteora (isian ESM↔CJS @coral-xyz/anchor).\n` +
-      `Turunkan ke Node 18/20 (Termux: pkg install nodejs) atau jalankan tanpa RPC_URL (dry-run aman).`
+      `Node 22+ (termasuk 26) butuh patch anchor: jalankan \`bash fix_node26.sh\` setelah npm install.\n` +
+      `Atau gunakan Node 18/20. Tanpa patch, jalankan tanpa RPC_URL (dry-run aman).`
     );
   }
 }
