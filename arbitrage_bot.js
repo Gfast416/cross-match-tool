@@ -45,6 +45,21 @@ const MIN_MISPRICING = parseFloat(process.env.MIN_MISPRICING || process.argv[3] 
 const ADD_CLOSE_LEG = (process.env.ADD_CLOSE_LEG || 'false').toLowerCase() === 'true';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '30000', 10);
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '5', 10); // match cross_match.js (2500 pools/venue)
+const RPC_TIMEOUT_MS = parseInt(process.env.RPC_TIMEOUT_MS || '20000', 10);
+
+// Race a promise against a timeout so a slow/stalled Helius free-RPC call can
+// never hang the bot silently (Node's Connection/fetch have NO default timeout).
+async function withTimeout(promise, ms = RPC_TIMEOUT_MS, label = 'rpc') {
+  let timer;
+  const timeout = new Promise((_, reject) =>
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms (RPC stalled?)`)), ms)
+  );
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const DLMM_API = 'https://dlmm.datapi.meteora.ag/pools';
 const DAMM_API = 'https://damm-v2.datapi.meteora.ag/pools';
@@ -74,7 +89,10 @@ async function fetchTokenPrice(mint) {
   const cached = priceCache.get(mint);
   if (cached && Date.now() - cached.ts < 5000) return cached.price;
   try {
-    const resp = await fetch(`${JUPITER_PRICE_API}?ids=${mint}`);
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), RPC_TIMEOUT_MS);
+    const resp = await fetch(`${JUPITER_PRICE_API}?ids=${mint}`, { signal: ctrl.signal });
+    clearTimeout(t);
     const data = await resp.json();
     const price = parseFloat(data?.[mint]?.usdPrice) || 0;
     priceCache.set(mint, { price, ts: Date.now() });
@@ -228,7 +246,11 @@ async function initRead() {
     DLMM = dlmmMod.default || dlmmMod.DLMM;
     CpAmm = cpAmmMod.CpAmm || cpAmmMod.default?.CpAmm || cpAmmMod.default;
     getTokenProgram = cpAmmMod.getTokenProgram || (() => TOKEN_PROGRAM_ID);
-    connection = new Connection(process.env.RPC_URL, 'confirmed');
+    connection = new Connection(process.env.RPC_URL, {
+      commitment: 'confirmed',
+      confirmTransactionInitialTimeout: RPC_TIMEOUT_MS,
+      fetchMiddleware: undefined
+    });
   } catch (e) {
     throw new Error(
       `Gagal load SDK Meteora (${e.message.split('\n')[0]}).\n` +
@@ -302,10 +324,13 @@ async function getPriorityFeeMicroLamports() {
       jsonrpc: '2.0', id: 1, method: 'getPriorityFeeEstimate',
       params: [{ options: { priorityLevel: 'Min' } }]
     };
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), RPC_TIMEOUT_MS);
     const res = await fetch(process.env.RPC_URL, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body), signal: ctrl.signal
     });
+    clearTimeout(t);
     const json = await res.json();
     const micro = Number(json?.result?.priorityFeeEstimate) || 0;
     FEE_CACHE.value = micro; FEE_CACHE.ts = now;
@@ -340,7 +365,7 @@ async function prepareWsol(lamports) {
   const ixs = [];
   // idempotent: create the WSOL ATA only if missing
   try {
-    await getAccount(connection, ata);
+    await withTimeout(getAccount(connection, ata), RPC_TIMEOUT_MS, 'getAccount WSOL ATA');
   } catch {
     ixs.push(createAssociatedTokenAccountInstruction(
       wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, TOKEN_PROGRAM_ID
@@ -352,7 +377,7 @@ async function prepareWsol(lamports) {
   ixs.push(createSyncNativeInstruction(ata, TOKEN_PROGRAM_ID));
   const tx = new Transaction().add(...ixs);
   tx.feePayer = wallet.publicKey;
-  const { blockhash } = await connection.getLatestBlockhash('confirmed');
+  const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash');
   tx.recentBlockhash = blockhash;
   const optimized = await addFeeOptimization(tx, 200_000);
   return await sendAndConfirm(optimized, 'wrap SOL->WSOL');
@@ -364,7 +389,7 @@ async function closeWsol() {
     const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
     let info;
     try {
-      info = await connection.getTokenAccountBalance(ata);
+      info = await withTimeout(connection.getTokenAccountBalance(ata), RPC_TIMEOUT_MS, 'getTokenAccountBalance');
     } catch {
       return null; // WSOL ATA doesn't exist — nothing to close
     }
@@ -378,7 +403,7 @@ async function closeWsol() {
     );
     let tx = new Transaction().add(ix);
     tx.feePayer = wallet.publicKey;
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash close');
     tx.recentBlockhash = blockhash;
     tx = await addFeeOptimization(tx, 150_000);
     return await sendAndConfirm(tx, 'close WSOL');
@@ -399,7 +424,7 @@ async function sendAndConfirm(tx, label) {
     throw new Error(`${label} send failed: ${msg}`);
   }
   log(`      📨 ${label} sent: ${sig}`);
-  const conf = await connection.confirmTransaction(sig, 'confirmed');
+  const conf = await withTimeout(connection.confirmTransaction(sig, 'confirmed'), 30000, `${label} confirm`);
   if (conf.value.err) throw new Error(`${label} confirm err: ${JSON.stringify(conf.value.err)}`);
   return sig;
 }
@@ -427,11 +452,11 @@ async function executeLive(route) {
   let sigs = [];
   // ---------- Leg 1: SOL (WSOL) -> token (on the pool that contains WSOL) ----------
   if (route.leg1IsDlmm) {
-    const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' });
+    const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
     const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL
-    const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
-    const quote = await dlmmPool.swapQuote(new BN(lamports), swapForY, dlmmSlippageBps(), binArrays);
-    let tx = await dlmmPool.swap({
+    const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
+    const quote = await withTimeout(dlmmPool.swapQuote(new BN(lamports), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1');
+    let tx = await withTimeout(dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
       inAmount: new BN(lamports),
@@ -439,15 +464,15 @@ async function executeLive(route) {
       user: wallet.publicKey,
       minOutAmount: quote.minOutAmount,
       outToken: dlmmPool.tokenY.publicKey
-    });
+    }), 25000, 'DLMM.swap leg1');
     tx = await addFeeOptimization(tx, 600_000);
     const sig1 = await sendAndConfirm(tx, 'DLMM swap (leg1)');
     sigs.push(sig1);
     var leg1OutAmount = quote.outAmount;
   } else {
     const cpAmm = new CpAmm(connection);
-    const poolState = await cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address));
-    const dammQuote = await cpAmm.getQuote({
+    const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address)), 20000, 'fetchPoolState leg1');
+    const dammQuote = await withTimeout(cpAmm.getQuote({
       inAmount: new BN(lamports),
       inputTokenMint: new PublicKey(WSOL_MINT),
       slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'),
@@ -456,9 +481,9 @@ async function executeLive(route) {
       currentSlot: 0,
       tokenADecimal: 9,
       tokenBDecimal: 9,
-    });
+    }), 20000, 'getQuote leg1');
     const minOut1 = dammQuote?.minSwapOutAmount || new BN(0);
-    let tx = await cpAmm.swap({
+    let tx = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg1Pool.raw.address),
       inputTokenMint: new PublicKey(WSOL_MINT),
@@ -473,7 +498,7 @@ async function executeLive(route) {
       tokenBProgram: getTokenProgram(poolState.tokenBFlag),
       referralTokenAccount: null,
       poolState
-    });
+    }), 25000, 'CpAmm.swap leg1');
     tx = await addFeeOptimization(tx, 400_000);
     const sig1 = await sendAndConfirm(tx, 'DAMMv2 swap (leg1)');
     sigs.push(sig1);
@@ -482,11 +507,11 @@ async function executeLive(route) {
 
   // ---------- Leg 2: token -> USDC (on the pool that contains USDC) ----------
   if (route.leg2IsDlmm) {
-    const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' });
+    const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
     const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token
-    const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
-    const quote = await dlmmPool.swapQuote(leg1OutAmount, swapForY, dlmmSlippageBps(), binArrays);
-    let tx2 = await dlmmPool.swap({
+    const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
+    const quote = await withTimeout(dlmmPool.swapQuote(leg1OutAmount, swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
+    let tx2 = await withTimeout(dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
       inAmount: quote.outAmount,
@@ -494,14 +519,14 @@ async function executeLive(route) {
       user: wallet.publicKey,
       minOutAmount: quote.minOutAmount,
       outToken: dlmmPool.tokenY.publicKey
-    });
+    }), 25000, 'DLMM.swap leg2');
     tx2 = await addFeeOptimization(tx2, 600_000);
     const sig2 = await sendAndConfirm(tx2, 'DLMM swap (leg2)');
     sigs.push(sig2);
   } else {
     const cpAmm = new CpAmm(connection);
-    const poolState = await cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address));
-    const dammQuote2 = await cpAmm.getQuote({
+    const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address)), 20000, 'fetchPoolState leg2');
+    const dammQuote2 = await withTimeout(cpAmm.getQuote({
       inAmount: leg1OutAmount,
       inputTokenMint: tokenMint,
       slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'),
@@ -510,9 +535,9 @@ async function executeLive(route) {
       currentSlot: 0,
       tokenADecimal: 9,
       tokenBDecimal: 9,
-    });
+    }), 20000, 'getQuote leg2');
     const minOut2 = dammQuote2?.minSwapOutAmount || new BN(0);
-    let tx2 = await cpAmm.swap({
+    let tx2 = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg2Pool.raw.address),
       inputTokenMint: tokenMint,
@@ -527,7 +552,7 @@ async function executeLive(route) {
       tokenBProgram: getTokenProgram(poolState.tokenBFlag),
       referralTokenAccount: null,
       poolState
-    });
+    }), 25000, 'CpAmm.swap leg2');
     tx2 = await addFeeOptimization(tx2, 400_000);
     const sig2 = await sendAndConfirm(tx2, 'DAMMv2 swap (leg2)');
     sigs.push(sig2);
@@ -548,37 +573,40 @@ async function verifyPoolUsable(route) {
   if (!connection) await initRead(); // read-only: no wallet needed
   try {
     // Probe Leg-1 pool (SOL/WSOL side)
+    log(`      🔎 probing leg1 (${route.leg1Venue})...`);
     if (route.leg1IsDlmm) {
-      const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' });
+      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
       const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT);
-      const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
-      await dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays); // tiny amount, read-only
+      const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
+      await withTimeout(dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1'); // tiny amount, read-only
     } else {
       const cpAmm = new CpAmm(connection);
-      const ps = await cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address));
-      await cpAmm.getQuote({
+      const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address)), 20000, 'fetchPoolState leg1');
+      await withTimeout(cpAmm.getQuote({
         inAmount: new BN(1e6), inputTokenMint: new PublicKey(WSOL_MINT),
         slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
         currentTime: Math.floor(Date.now() / 1000), currentSlot: 0,
         tokenADecimal: 9, tokenBDecimal: 9
-      });
+      }), 20000, 'getQuote leg1');
     }
+    log(`      🔎 probing leg2 (${route.leg2Venue})...`);
     // Probe Leg-2 pool (USDC side)
     if (route.leg2IsDlmm) {
-      const dlmmPool = await DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' });
+      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
       const swapForY = dlmmSwapForY(dlmmPool, route.tokenMint);
-      const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
-      await dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays);
+      const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
+      await withTimeout(dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
     } else {
       const cpAmm = new CpAmm(connection);
-      const ps = await cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address));
-      await cpAmm.getQuote({
+      const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address)), 20000, 'fetchPoolState leg2');
+      await withTimeout(cpAmm.getQuote({
         inAmount: new BN(1e6), inputTokenMint: new PublicKey(route.tokenMint),
         slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
         currentTime: Math.floor(Date.now() / 1000), currentSlot: 0,
         tokenADecimal: 9, tokenBDecimal: 9
-      });
+      }), 20000, 'getQuote leg2');
     }
+    log(`      ✅ pool probe OK (both venues tradeable)`);
     return { ok: true };
   } catch (e) {
     const msg = e?.message || String(e);
