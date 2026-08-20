@@ -223,11 +223,13 @@ async function initRead() {
 }
 
 async function initLive() {
-  if (connection) return;
   if (!process.env.WALLET_PRIVATE_KEY) throw new Error('WALLET_PRIVATE_KEY diperlukan untuk live mode.');
-  await initRead();
-  const secret = JSON.parse(Buffer.from(process.env.WALLET_PRIVATE_KEY, 'base64').toString('utf8'));
-  wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
+  // connection+SDK may already be set by initRead() (pool probe); only (re)set wallet here.
+  if (!connection) await initRead();
+  if (!wallet) {
+    const secret = JSON.parse(Buffer.from(process.env.WALLET_PRIVATE_KEY, 'base64').toString('utf8'));
+    wallet = Keypair.fromSecretKey(Uint8Array.from(secret));
+  }
 }
 
 /**
