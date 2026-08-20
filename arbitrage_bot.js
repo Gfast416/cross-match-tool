@@ -155,6 +155,7 @@ function buildRoute(candidate, startAmountLamports) {
   const dammHasWsol = has(dammRaw, WSOL_MINT);
   const dlmmHasUsdc = has(dlmmRaw, USDC_MINT);
   const dammHasUsdc = has(dammRaw, USDC_MINT);
+  log(`      [debug route] dlmmRaw.token_x=${dlmmRaw?.token_x?.address||dlmmRaw?.tokenX?.address} token_y=${dlmmRaw?.token_y?.address||dlmmRaw?.tokenY?.address} dlmmHasWsol=${dlmmHasWsol} dammHasWsol=${dammHasWsol} dlmmHasUsdc=${dlmmHasUsdc} dammHasUsdc=${dammHasUsdc}`);
 
   const leg1Pool = dlmmHasWsol ? candidate.dlmmPool : candidate.dammPool; // SOL side
   const leg2Pool = dlmmHasUsdc ? candidate.dlmmPool : candidate.dammPool; // USDC side
