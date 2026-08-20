@@ -40,11 +40,11 @@ import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, Co
 const MODE = (process.env.MODE || 'dry-run').toLowerCase();
 const TRADE_AMOUNT_SOL = parseFloat(process.env.TRADE_AMOUNT_SOL || '0.5');
 const MIN_PROFIT_PCT = parseFloat(process.env.MIN_PROFIT_PCT || '1.0');
-const MIN_TVL = parseFloat(process.env.MIN_TVL || process.argv[2] || '500');
-const MIN_MISPRICING = parseFloat(process.env.MIN_MISPRICING || process.argv[3] || '1.0');
+const MIN_TVL = parseFloat(process.env.MIN_TVL || process.argv[2] || '100');
+const MIN_MISPRICING = parseFloat(process.env.MIN_MISPRICING || process.argv[3] || '0.5');
 const ADD_CLOSE_LEG = (process.env.ADD_CLOSE_LEG || 'false').toLowerCase() === 'true';
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '30000', 10);
-const MAX_PAGES = parseInt(process.env.MAX_PAGES || '3', 10); // Termux-friendly; raise for deeper scans
+const MAX_PAGES = parseInt(process.env.MAX_PAGES || '5', 10); // match cross_match.js (2500 pools/venue)
 
 const DLMM_API = 'https://dlmm.datapi.meteora.ag/pools';
 const DAMM_API = 'https://damm-v2.datapi.meteora.ag/pools';
