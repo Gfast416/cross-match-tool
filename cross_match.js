@@ -5,6 +5,7 @@
 // Features:
 //   - Dynamic mint/token scanning from Meteora DLMM + DAMM APIs (multi-page)
 //   - Dead pool detection (>20% deviation from Jupiter oracle = reject)
+//   - Noise filter: skips pools whose base token is SOL/USDC/USDT (absurd routes)
 //   - 5-second Jupiter price cache (fee-efficient)
 //   - Serialized logging (anti-garbled output)
 //   - Configurable minTVL / minMispricingPct via CLI args
@@ -20,6 +21,13 @@ const MIN_TVL        = parseFloat(process.argv[2] || "100");
 const MIN_MISPRICING = parseFloat(process.argv[3] || "1.0");
 const SCAN_INTERVAL_MS = 30000; // 30 seconds
 const MAX_PAGES = 5; // Scan up to 5 pages per venue (2500 pools each)
+
+// Quote/input tokens — a pool whose base is one of these is noise (e.g. SOL-BILLY
+// where base = WSOL itself). Skipped so we never report an absurd SOL→WSOL route.
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkYWkuDt1v';
+const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+const QUOTE_MINTS = new Set([WSOL_MINT, USDC_MINT, USDT_MINT]);
 
 // --- Serialized Logging (anti-garbled output) ---
 let logBuffer = [];
@@ -94,6 +102,12 @@ async function refresh() {
 
     const candidate = findCandidates(dlmmPool, dammPool, jupiterPrice, MIN_MISPRICING);
     if (candidate) {
+      // Noise filter: skip if the base token is one of our quote/input tokens
+      // (e.g. SOL-BILLY where base = WSOL → absurd SOL→WSOL route).
+      if (QUOTE_MINTS.has(candidate.baseMint)) {
+        log(`   ⚪ Skipping ${candidate.name} — base is ${candidate.baseMint.slice(0, 6)} (SOL/USDC/USDT), not a real arb target`);
+        continue;
+      }
       candidates.push(candidate);
       log(`   ✅ Candidate found: ${candidate.name} | Mispricing: ${candidate.mispricingPct.toFixed(2)}%`);
     }
