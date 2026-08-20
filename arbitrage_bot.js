@@ -165,7 +165,7 @@ function buildRoute(candidate, startAmountLamports) {
   // No valid route if NEITHER venue has a WSOL pool for this token — SOL can't enter.
   // (e.g. USWS only has USDC pairs in both DLMM & DAMMv2). Skip this candidate.
   if (!dlmmHasWsol && !dammHasWsol) {
-    log(`      ⚠️ no WSOL pool for ${symbol} in either venue — cannot route SOL in — skip`);
+    log(`      ⚠️ no WSOL pool for ${tokenMint.slice(0, 6)} in either venue — cannot route SOL in — skip`);
     return null;
   }
 
