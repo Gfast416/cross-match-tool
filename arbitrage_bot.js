@@ -495,6 +495,10 @@ async function executeLive(route) {
       tokenBDecimal: 9,
     }), 20000, 'getQuote leg1');
     const minOut1 = dammQuote?.minSwapOutAmount || new BN(0);
+    // Resolve token program: prefer on-chain poolState.tokenAProgram, else read mint owner (SPL vs Token-2022).
+    const taProg = poolState.tokenAProgram || await getMintProgram(poolState.tokenAMint);
+    const tbProg = poolState.tokenBProgram || await getMintProgram(poolState.tokenBMint);
+    log(`      [debug leg1] tokenAMint=${poolState.tokenAMint} tokenAFlag=${poolState.tokenAFlag} onChainProg=${poolState.tokenAProgram && poolState.tokenAProgram} ownerA=${taProg.toBase58()}`);
     let tx = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg1Pool.raw.address),
@@ -506,8 +510,8 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: await getMintProgram(poolState.tokenAMint),
-      tokenBProgram: await getMintProgram(poolState.tokenBMint),
+      tokenAProgram: taProg,
+      tokenBProgram: tbProg,
       referralTokenAccount: null,
       poolState
     }), 25000, 'CpAmm.swap leg1');
@@ -549,6 +553,9 @@ async function executeLive(route) {
       tokenBDecimal: 9,
     }), 20000, 'getQuote leg2');
     const minOut2 = dammQuote2?.minSwapOutAmount || new BN(0);
+    const taProg2 = poolState.tokenAProgram || await getMintProgram(poolState.tokenAMint);
+    const tbProg2 = poolState.tokenBProgram || await getMintProgram(poolState.tokenBMint);
+    log(`      [debug leg2] tokenAMint=${poolState.tokenAMint} tokenAFlag=${poolState.tokenAFlag} onChainProg=${poolState.tokenAProgram && poolState.tokenAProgram} ownerA=${taProg2.toBase58()}`);
     let tx2 = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg2Pool.raw.address),
@@ -560,8 +567,8 @@ async function executeLive(route) {
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
       tokenBVault: poolState.tokenBVault,
-      tokenAProgram: await getMintProgram(poolState.tokenAMint),
-      tokenBProgram: await getMintProgram(poolState.tokenBMint),
+      tokenAProgram: taProg2,
+      tokenBProgram: tbProg2,
       referralTokenAccount: null,
       poolState
     }), 25000, 'CpAmm.swap leg2');
