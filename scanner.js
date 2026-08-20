@@ -443,8 +443,9 @@ function normalizePool(rows, type, minTvl = 100) {
         volume24h = Number(row.volume24h || row.vol24h || row['24hVolume'] || 0);
       }
 
-      // Only include pools with sufficient TVL and valid data
-      if (tokenMint && priceUsd > 0 && tvlUsd >= minTvl) {
+      // Only include pools with sufficient TVL, some 24h volume, and valid data.
+      // volume24h > 0 filters out dead/illiquid pools (no trading activity).
+      if (tokenMint && priceUsd > 0 && tvlUsd >= minTvl && volume24h > 0) {
         poolMap.set(tokenMint, {
           venue: type,
           tokenMint,

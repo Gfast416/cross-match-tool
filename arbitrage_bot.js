@@ -645,12 +645,17 @@ async function cycle() {
       log(`\n   🎯 ${route.symbol} | mispricing ${c.mispricingPct.toFixed(2)}% | dir ${c.direction}`);
       log(`      Route: SOL→${route.tokenMint.slice(0,6)} (${route.leg1Venue}) → ${route.tokenMint.slice(0,6)} (${route.leg2Venue}) → USDC`);
       log(`      TVL: DLMM=$${route.dlmmPool.tvlUsd.toFixed(0)} | DAMM=$${route.dammPool.tvlUsd.toFixed(0)} (min $${MIN_TVL})`);
+      log(`      Vol24h: DLMM=$${route.dlmmPool.volume24h.toFixed(0)} | DAMM=$${route.dammPool.volume24h.toFixed(0)}`);
 
-      // Hard guard: both pools must clear the TVL floor (catches stale/low-liquidity
-      // pools that report a misleading TVL in one venue). Buffer x2 to avoid edge noise.
+      // Hard guard: both pools must clear the TVL floor AND have some 24h volume.
+      // (catches stale/low-liquidity pools — TVL alone can be misleading; no volume = dead pool)
       const tvlFloor = MIN_TVL * 2;
       if (route.dlmmPool.tvlUsd < tvlFloor || route.dammPool.tvlUsd < tvlFloor) {
         warn(`      💀 low TVL (DLMM $${route.dlmmPool.tvlUsd.toFixed(0)} / DAMM $${route.dammPool.tvlUsd.toFixed(0)} < $${tvlFloor}) — skip (dead/illiquid pool)`);
+        continue;
+      }
+      if (route.dlmmPool.volume24h <= 0 || route.dammPool.volume24h <= 0) {
+        warn(`      💀 zero volume (DLMM $${route.dlmmPool.volume24h.toFixed(0)} / DAMM $${route.dammPool.volume24h.toFixed(0)}) — skip (dead pool)`);
         continue;
       }
 
