@@ -357,6 +357,16 @@ async function closeWsol() {
   }
 }
 
+// Ensure the wallet has an Associated Token Account for `mint` (creates it if missing).
+// DAMMv2/DLMM swaps fail with "Account not associated with this Mint" if the
+// output ATA does not exist yet.
+async function ensureAta(mint) {
+  const ata = await getOrCreateAssociatedTokenAccount(
+    connection, wallet, new PublicKey(mint), wallet.publicKey
+  );
+  return ata.address;
+}
+
 async function sendAndConfirm(tx, label) {
   const sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
   log(`      📨 ${label} sent: ${sig}`);
@@ -424,6 +434,7 @@ async function executeLive(route) {
       tokenBDecimal: 9,
     });
     const minOut2 = dammQuote2?.minSwapOutAmount || new BN(0);
+    await ensureAta(USDC_MINT); // output ATA for DAMMv2 leg
     let tx2 = await cpAmm.swap({
       payer: wallet.publicKey,
       pool: dammAddr,
@@ -458,6 +469,8 @@ async function executeLive(route) {
       tokenBDecimal: 9,
     });
     const minOut1 = dammQuote?.minSwapOutAmount || new BN(0);
+    await ensureAta(tokenMint);      // output ATA for DAMMv2 leg (SOL->token)
+    await ensureAta(USDC_MINT);     // output ATA for DLMM leg 2 (token->USDC)
     let tx = await cpAmm.swap({
       payer: wallet.publicKey,
       pool: poolAddress,
