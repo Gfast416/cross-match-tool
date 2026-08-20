@@ -349,7 +349,7 @@ async function closeWsol() {
     const ix = createCloseAccountInstruction(
       ata, wallet.publicKey, wallet.publicKey, [], TOKEN_PROGRAM_ID
     );
-    const tx = new Transaction().add(ix);
+    let tx = new Transaction().add(ix);
     tx.feePayer = wallet.publicKey;
     const { blockhash } = await connection.getLatestBlockhash('confirmed');
     tx.recentBlockhash = blockhash;
@@ -375,7 +375,7 @@ async function ensureAta(mint) {
     const ix = createAssociatedTokenAccountInstruction(
       wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), TOKEN_PROGRAM_ID
     );
-    const tx = new Transaction().add(ix);
+    let tx = new Transaction().add(ix);
     tx.feePayer = wallet.publicKey;
     const { blockhash } = await connection.getLatestBlockhash('confirmed');
     tx.recentBlockhash = blockhash;
