@@ -28,13 +28,8 @@ async function executeJupiterSwap(inputMint, outputMint, amount, { dexes = null,
   const data = await res.json();
   const tx = VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64'));
   tx.sign([wallet]);
-  // simulate guard (free) — skip if unsupported
-  try {
-    const sim = await connection.simulateTransaction(tx);
-    if (sim.value.err) throw new Error(`simulate FAILED: ${JSON.stringify(sim.value.err)}`);
-  } catch (e) {
-    if (e.message.includes('simulate FAILED')) throw e;
-  }
+  // NOTE: skipping simulateTransaction in hot path (free Helius is slow). The quote already
+  // reflects real outAmount; we rely on slippageBps + sendAndConfirm for safety.
   const sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
   const conf = await connection.confirmTransaction(sig, 'confirmed');
   if (conf.value.err) throw new Error(`confirm err: ${JSON.stringify(conf.value.err)}`);
@@ -51,7 +46,7 @@ export async function executeSameTokenArb({ tokenMint, buyVenue, sellVenue, star
   const sigs = [];
   const h1 = await executeJupiterSwap(WSOL_MINT, tokenMint, startLamports, { dexes: buyDex, slippageBps });
   sigs.push(h1.sig);
-  await new Promise(r => setTimeout(r, 1200));
+  await new Promise(r => setTimeout(r, 300)); // throttle (was 1200ms — too slow for live)
   try {
     const h2 = await executeJupiterSwap(tokenMint, WSOL_MINT, h1.outAmount, { dexes: sellDex, slippageBps });
     sigs.push(h2.sig);

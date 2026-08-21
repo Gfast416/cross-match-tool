@@ -71,19 +71,22 @@ async function cycle() {
   });
   log(`   [scan] ${opps.length} same-token opportunities`);
 
+  // Quote TOP opportunities IN PARALLEL (speed: don't wait one-by-one).
+  const top = opps.slice(0, 5); // only quote the 5 best spreads (fast + avoids rate limit)
+  const results = await Promise.allSettled(top.map(opp => quoteSameTokenArb({
+    tokenMint: opp.tokenMint,
+    buyVenue: opp.buyPool.venue,
+    sellVenue: opp.sellPool.venue,
+    amountLamports: BigInt(Math.floor(TRADE_AMOUNT_SOL * 1e9)),
+    slippageBps: Math.round(SLIPPAGE_PCT * 100)
+  }).then(q => ({ opp, q }))));
+
   const ranked = [];
-  for (const opp of opps.slice(0, 15)) { // limit quotes to avoid rate limit
-    try {
-      const q = await quoteSameTokenArb({
-        tokenMint: opp.tokenMint,
-        buyVenue: opp.buyPool.venue,
-        sellVenue: opp.sellPool.venue,
-        amountLamports: BigInt(Math.floor(TRADE_AMOUNT_SOL * 1e9)),
-        slippageBps: Math.round(SLIPPAGE_PCT * 100)
-      });
-      if (q.netPct >= MIN_PROFIT_PCT) ranked.push({ ...opp, quote: q });
-    } catch (e) {
-      dbg(`quote failed ${opp.tokenMint.slice(0,6)}: ${e.message}`);
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value.q.netPct >= MIN_PROFIT_PCT) {
+      ranked.push({ ...r.value.opp, quote: r.value.q });
+    } else if (r.status === 'rejected') {
+      dbg(`quote failed: ${r.reason?.message || r.reason}`);
     }
   }
   ranked.sort((a, b) => b.quote.netPct - a.quote.netPct);
