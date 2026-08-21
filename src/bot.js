@@ -29,11 +29,21 @@ async function enrichUsdPrices() {
   const mints = [...store.byMint.keys()];
   const prices = await fetchJupiterPrices(mints.slice(0, 400));
   let enriched = 0;
+  // Primary: Jupiter USD (if reachable).
   for (const p of store.getAll()) {
     if (p.mintA && prices[p.mintA]) { p.priceUsdA = prices[p.mintA]; enriched++; }
     if (p.mintB && prices[p.mintB]) { p.priceUsdB = prices[p.mintB]; }
   }
-  dbg(`enriched ${enriched}/${store.getAll().length} pools with Jupiter USD`);
+  // Fallback: derive USD from pools quoted in USDC/USDT (ratio * 1 USD) when Jupiter unreachable.
+  if (enriched === 0) {
+    for (const p of store.getAll()) {
+      const isUsdc = (m) => m === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' || m === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+      if (p.mintA && isUsdc(p.mintB) && p.price > 0) { p.priceUsdA = p.price; enriched++; }
+      if (p.mintB && isUsdc(p.mintA) && p.price > 0) { p.priceUsdB = p.price; }
+    }
+    dbg('Jupiter unreachable — derived USD from USDC/USDT-quoted pools');
+  }
+  dbg(`enriched ${enriched}/${store.getAll().length} pools with USD`);
   return prices;
 }
 

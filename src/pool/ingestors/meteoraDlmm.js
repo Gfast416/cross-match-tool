@@ -2,10 +2,9 @@
 // For compatibility we keep both files but point them at the real Meteora API.
 import axios from 'axios';
 import { normalizeMeteora } from '../normalize.js';
-import { MIN_TVL, MAX_PAGES, DEBUG } from '../../config.js';
+import { MIN_TVL, MAX_PAGES, DEBUG, warn } from '../../config.js';
 
-// Verified endpoint (used by scanner.js). We try a chain of hosts because some
-// Termux networks block one host but resolve another.
+// Termux networks sometimes ENOTFOUND one host but resolve another — try a chain.
 const HOSTS = [
   'https://api.meteora.io/v1/pools',
   'https://dlmm.api.meteora.ag/v1/pools',
