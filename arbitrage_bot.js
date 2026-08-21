@@ -830,21 +830,23 @@ async function cycle() {
       const route = buildRoute(c, startLamports);
       if (!route) {
         // No WSOL-entry route (token has no WSOL pool in Meteora). Try adaptive transit
-        // via Jupiter: SOL->USDC->A->SOL (only if token has a Meteora pool to capture misprice).
+        // via Jupiter: SOL->quoteToken->A->quoteToken->SOL using whatever DEX holds the pools.
+        // quoteToken can be USDC, USDT, PUMP, BONK, etc. — any token the mispriced Meteora
+        // pool is quoted in.
         const inMeteora = c.dlmmPool || c.dammPool;
         const tk = c.baseMint || c.tokenMint;
         const qtRaw = c.crossDex?.quoteToken;
+        // Skip only if there's truly no Meteora pool, or the quote token is WSOL (redundant loop).
         if (inMeteora && tk && c.crossDex && qtRaw && qtRaw !== WSOL_MINT) {
-          const qt = qtRaw === USDC_MINT ? ROUTER_USDC : ROUTER_USDT;
           const sym = c.symbol || tk.slice(0, 6);
-          log(`\n   🎯 CROSS-DEX ${sym} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qt.slice(0,6)} | (no WSOL pool → adaptive SOL->${qt.slice(0,6)}->A->SOL)`);
+          log(`\n   🎯 CROSS-DEX ${sym} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qtRaw.slice(0,6)} | (adaptive SOL->${qtRaw.slice(0,6)}->A->${qtRaw.slice(0,6)}->SOL)`);
           if (MODE === 'dry-run') {
-            log(`      ⚪ dry-run: would execute adaptive route via Jupiter`);
+            log(`      ⚪ dry-run: would execute adaptive route via Jupiter (DEX-agnostic)`);
             continue;
           }
           try {
             initRouter(connection, wallet);
-            const sigs = await executeAdaptiveRoute({ tokenMint: tk, quoteToken: qt, mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined, startLamports });
+            const sigs = await executeAdaptiveRoute({ tokenMint: tk, quoteToken: qtRaw, mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined, startLamports });
             log(`      ✅ CROSS-DEX LIVE done: ${sigs.join(' , ')}`);
             for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
           } catch (e) { fail('cross-dex adaptive', e); }

@@ -661,15 +661,17 @@ async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, o
     const meteoraInvolved = ('dlmm' in prices) || ('damm' in prices);
     if (!meteoraInvolved) continue;
 
-    // Determine the quote token of the Meteora mispriced pool (WSOL / USDC / USDT)
+    // Determine the quote token of the Meteora mispriced pool — the OTHER token in the
+    // pool (not the mispriced token itself). This can be USDC, USDT, WSOL, PUMP, BONK, etc.
+    // We route SOL -> quoteToken -> A -> quoteToken -> SOL using whatever DEX has the pools.
     let quoteToken = null;
     const mp = dlmm || damm;
     if (mp) {
       const xs = mp.raw?.token_x?.address || mp.raw?.tokenX?.address || mp.raw?.token_a_mint || '';
       const ys = mp.raw?.token_y?.address || mp.raw?.tokenY?.address || mp.raw?.token_b_mint || '';
-      if (xs === WSOL_MINT || ys === WSOL_MINT) quoteToken = WSOL_MINT;
-      else if (xs === USDC_MINT || ys === USDC_MINT) quoteToken = USDC_MINT;
-      else if (xs === USDT_MINT || ys === USDT_MINT) quoteToken = USDT_MINT;
+      // The quote token is whichever of the two pool mints is NOT the mispriced token.
+      if (xs && xs !== mint) quoteToken = xs;
+      else if (ys && ys !== mint) quoteToken = ys;
     }
 
     results.push({
