@@ -397,6 +397,9 @@ async function addFeeOptimization(tx, estimateCu) {
 // (e.g. Token-2022 from an earlier run), we must close+recreate it as SPL first,
 // otherwise every swap fails with "Account not associated with this Mint" / "IllegalOwner".
 async function prepareWsol(lamports) {
+  // Wrap slightly LESS than `lamports` so the wallet keeps enough native SOL to pay the
+  // wrap tx fee (otherwise the transfer empties the wallet and the tx fails -> WSOL ATA stays 0).
+  const wrapAmount = lamports - 5_000;
   const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
   const SPL = TOKEN_PROGRAM_ID;
   let info = null;
@@ -418,7 +421,7 @@ async function prepareWsol(lamports) {
     } else {
       // Healthy SPL ATA already present — just wrap (do NOT recreate, avoids "already in use").
       const wrapTx = new Transaction().add(
-        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports }),
+        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports: wrapAmount }),
         createSyncNativeInstruction(ata, SPL)
       );
       wrapTx.feePayer = wallet.publicKey;
@@ -431,7 +434,7 @@ async function prepareWsol(lamports) {
   // Create ATA (fresh or after close) + wrap in one tx.
   const ixs = [
     createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, SPL),
-    SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports }),
+    SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports: wrapAmount }),
     createSyncNativeInstruction(ata, SPL)
   ];
   const tx = new Transaction().add(...ixs);
@@ -544,6 +547,17 @@ async function executeLive(route) {
   const tokenMint = new PublicKey(route.tokenMint);
   const lamports = route.startAmountLamports;
 
+  // Guard: wrapping needs native SOL = wrapAmount + tx fees, so require a buffer over the trade size.
+  try {
+    const bal = await withTimeout(connection.getBalance(wallet.publicKey), RPC_TIMEOUT_MS, 'getBalance');
+    const needed = lamports + 10_000_000; // trade + ~0.01 SOL buffer for wrap/swap/close fees
+    if (bal < needed) {
+      warn(`⚠️ wallet SOL=${bal/1e9} < needed ${needed/1e9} SOL — wrap will fail with insufficient funds. Top up wallet.`);
+      return [];
+    }
+    dbg(`wallet SOL=${bal/1e9} needed>=${needed/1e9}`);
+  } catch { /* non-fatal */ }
+
   // Pre-create the leg-1 OUTPUT token ATA (separate tx) so the swap's own
   // getOrCreateATAInstruction finds an already-initialized account.
   await ensureAtaSeparate(tokenMint);
@@ -563,7 +577,7 @@ async function executeLive(route) {
     const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
     const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
-    const inLamports = lamports - 100_000; // leave WSOL for the DLMM fee
+    const inLamports = lamports - 105_000; // wrapAmount(5k buffer) minus DLMM fee room
     const quote = await withTimeout(dlmmPool.swapQuote(new BN(inLamports), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1');
     let tx = await withTimeout(dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
