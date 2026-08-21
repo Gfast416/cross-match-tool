@@ -879,6 +879,52 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
       process.exit(1);
     }
   })();
+} else if (process.argv.includes('watch')) {
+  // REAL-TIME mode: watch new/imbalanced Meteora pools via logsSubscribe, evaluate misprice, execute.
+  (async () => {
+    const { watchNewPools } = await import('./watcher.js');
+    const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+    log(`\n👁️ WATCH MODE — real-time Meteora pool detection (execute on misprice > ${MIN_MISPRICING}%)`);
+    watchNewPools({
+      rpcUrl: RPC_URL,
+      minMispricePct: MIN_MISPRICING,
+      onCandidate: async (info) => {
+        try {
+          // Only act on pools that contain WSOL (so we can route SOL in) or USDC (route out).
+          const hasWsol = info.tokenX === WSOL_MINT || info.tokenY === WSOL_MINT;
+          const hasUsdc = info.tokenX === USDC_MINT || info.tokenY === USDC_MINT;
+          const baseMint = info.tokenX === WSOL_MINT || info.tokenX === USDC_MINT ? info.tokenY
+                         : info.tokenY === WSOL_MINT || info.tokenY === USDC_MINT ? info.tokenX : null;
+          if (!baseMint) { dbg(`pool ${info.poolAddress.slice(0,8)} no WSOL/USDC — skip`); return; }
+          log(`\n🆕 POOL ${info.venue} ${info.poolAddress.slice(0,10)} token=${baseMint.slice(0,6)} wsol=${hasWsol} usdc=${hasUsdc}`);
+          // Fetch the counterpart pool (dlmm<->damm) for the same token to build a 2-hop route.
+          const [dlmmRows, dammRows] = await Promise.all([
+            fetchAllPages('DLMM', DLMM_API, MAX_PAGES),
+            fetchAllPages('DAMM', DAMM_API, MAX_PAGES)
+          ]);
+          const dlmmPoolMap = normalizePool(dlmmRows, 'dlmm', MIN_TVL);
+          const dammPoolMap = normalizePool(dammRows, 'damm', MIN_TVL);
+          if (!dlmmPoolMap.has(baseMint) || !dammPoolMap.has(baseMint)) {
+            log(`   ⚪ counterpart pool missing for ${baseMint.slice(0,6)} — skip`); return;
+          }
+          const cand = { baseMint, direction: 'BUY_A_SELL_B', mispricingPct: 99, dlmmPool: dlmmPoolMap.get(baseMint), dammPool: dammPoolMap.get(baseMint) };
+          const route = buildRoute(cand, Math.floor(TRADE_AMOUNT_SOL * 1e9));
+          if (!route) { log(`   ⚪ no WSOL route for ${baseMint.slice(0,6)} — skip`); return; }
+          // dry-run estimate first
+          const sim = await dryRun(route);
+          if (!sim) { log(`   ⚪ dry-run failed — skip`); return; }
+          log(`   💡 est net ${sim.netPct.toFixed(2)}% (${route.leg1Venue}->${route.leg2Venue})`);
+          if (sim.netPct >= MIN_PROFIT_PCT && MODE === 'live') {
+            const res = await executeLive(route);
+            log(`   ✅ WATCH executed (${res.venue}): ${res.sigs.join(' , ')}`);
+            for (const s of res.sigs) log(`   https://solscan.io/tx/${s}`);
+          } else {
+            log(`   ⚪ below min profit (${MIN_PROFIT_PCT}%) — watch only`);
+          }
+        } catch (e) { fail('watch candidate', e); }
+      }
+    });
+  })();
 } else {
   cycle();
   setInterval(cycle, SCAN_INTERVAL_MS);
