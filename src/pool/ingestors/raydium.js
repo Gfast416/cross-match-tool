@@ -10,7 +10,8 @@ export async function fetchRaydium({ minTvl = MIN_TVL, maxPages = MAX_PAGES, pag
   for (let page = 1; page <= maxPages; page++) {
     try {
       const { data } = await axios.get(API, {
-        params: { poolType: 'all', poolSortField: 'liquidity', sortType: 'desc', pageSize, page }
+        params: { poolType: 'all', poolSortField: 'liquidity', sortType: 'desc', pageSize, page },
+        timeout: 10000
       });
       const rows = data?.data?.data || data?.data || [];
       if (!rows.length) break;

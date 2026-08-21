@@ -9,7 +9,7 @@ export async function fetchOrca({ minTvl = MIN_TVL, maxPages = MAX_PAGES, size =
   const out = [];
   for (let page = 1; page <= maxPages; page++) {
     try {
-      const { data } = await axios.get(API, { params: { minTvl, sortBy: 'tvl', page, size } });
+      const { data } = await axios.get(API, { params: { minTvl, sortBy: 'tvl', page, size }, timeout: 10000 });
       const rows = data?.pools || data?.data || data || [];
       if (!Array.isArray(rows) || !rows.length) break;
       for (const r of rows) {

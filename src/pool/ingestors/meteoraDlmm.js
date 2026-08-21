@@ -11,7 +11,7 @@ async function fetchMeteora(poolType, venue, { minTvl = MIN_TVL, maxPages = MAX_
   const out = [];
   for (let page = 1; page <= maxPages; page++) {
     try {
-      const { data } = await axios.get(API, { params: { page, pageSize, pool_type: poolType } });
+      const { data } = await axios.get(API, { params: { page, pageSize, pool_type: poolType }, timeout: 10000 });
       const rows = Array.isArray(data) ? data : (data?.data || []);
       if (!rows.length) break;
       for (const r of rows) {

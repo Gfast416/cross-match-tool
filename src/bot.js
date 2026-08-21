@@ -13,7 +13,17 @@ import {
   log, warn, dbg
 } from './config.js';
 
+process.on('unhandledRejection', e => { console.error('[unhandledRejection]', e?.message || e); });
+process.on('uncaughtException', e => { console.error('[uncaughtException]', e?.message || e); });
+
 const store = new PoolStore();
+
+async function timed(label, fn) {
+  const t0 = Date.now();
+  const r = await fn();
+  dbg(`${label} took ${Date.now() - t0}ms`);
+  return r;
+}
 
 async function enrichUsdPrices() {
   const mints = [...store.byMint.keys()];
@@ -30,12 +40,13 @@ async function enrichUsdPrices() {
 async function ingestAll() {
   store.clear();
   const [dlmm, damm, ray, orca] = await Promise.all([
-    fetchMeteoraDlmm({ minTvl: MIN_TVL }).catch(() => []),
-    fetchMeteoraDamm({ minTvl: MIN_TVL }).catch(() => []),
-    fetchRaydium({ minTvl: MIN_TVL }).catch(() => []),
-    fetchOrca({ minTvl: MIN_TVL }).catch(() => [])
+    timed('meteora-dlmm', () => fetchMeteoraDlmm({ minTvl: MIN_TVL }).catch(e => { warn('dlmm ingest failed:', e.message); return []; })),
+    timed('meteora-damm', () => fetchMeteoraDamm({ minTvl: MIN_TVL }).catch(e => { warn('damm ingest failed:', e.message); return []; })),
+    timed('raydium', () => fetchRaydium({ minTvl: MIN_TVL }).catch(e => { warn('raydium ingest failed:', e.message); return []; })),
+    timed('orca', () => fetchOrca({ minTvl: MIN_TVL }).catch(e => { warn('orca ingest failed:', e.message); return []; }))
   ]);
   store.addMany([...dlmm, ...damm, ...ray, ...orca]);
+  log(`   [ingest-detail] dlmm=${dlmm.length} damm=${damm.length} ray=${ray.length} orca=${orca.length}`);
   return store.stats();
 }
 
