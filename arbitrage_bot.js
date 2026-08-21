@@ -187,6 +187,17 @@ async function scanForCandidates() {
         continue;
       }
       if (dlmm || damm) {
+        // Determine the quote token of the Meteora mispriced pool (USDC/USDT) from the REAL raw.
+        const realRaw = (dlmm || damm).raw || {};
+        const hasTok = (r, m) => {
+          const xs = r?.token_x?.address || r?.tokenX?.address || r?.token_a_mint || '';
+          const ys = r?.token_y?.address || r?.tokenY?.address || r?.token_b_mint || '';
+          return xs === m || ys === m;
+        };
+        let quoteToken = null;
+        if (hasTok(realRaw, USDC_MINT)) quoteToken = USDC_MINT;
+        else if (hasTok(realRaw, USDT_MINT)) quoteToken = USDT_MINT;
+        else if (hasTok(realRaw, WSOL_MINT)) quoteToken = WSOL_MINT;
         candidates.push({
           baseMint: cd.tokenMint,
           name: cd.symbol,
@@ -194,7 +205,7 @@ async function scanForCandidates() {
           mispricingPct: cd.spreadPct,
           dlmmPool: dlmm || { priceUsd: cd.prices.dlmm || 0, tvlUsd: 0, volume24h: 0, raw: {} },
           dammPool: damm || { priceUsd: cd.prices.damm || 0, tvlUsd: 0, volume24h: 0, raw: {} },
-          crossDex: cd,
+          crossDex: { ...cd, quoteToken },
           source: 'cross-dex'
         });
       }
@@ -815,16 +826,19 @@ async function cycle() {
         // No WSOL-entry route (token has no WSOL pool in Meteora). Try adaptive transit
         // via Jupiter: SOL->USDC->A->SOL (only if token has a Meteora pool to capture misprice).
         const inMeteora = c.dlmmPool || c.dammPool;
-        if (inMeteora && c.crossDex && c.crossDex.quoteToken && c.crossDex.quoteToken !== WSOL_MINT) {
-          const qt = c.crossDex.quoteToken === USDC_MINT ? ROUTER_USDC : ROUTER_USDT;
-          log(`\n   🎯 CROSS-DEX ${c.symbol} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qt.slice(0,6)} | (no WSOL pool → adaptive SOL->${qt.slice(0,6)}->A->SOL)`);
+        const tk = c.baseMint || c.tokenMint;
+        const qtRaw = c.crossDex?.quoteToken;
+        if (inMeteora && tk && c.crossDex && qtRaw && qtRaw !== WSOL_MINT) {
+          const qt = qtRaw === USDC_MINT ? ROUTER_USDC : ROUTER_USDT;
+          const sym = c.symbol || tk.slice(0, 6);
+          log(`\n   🎯 CROSS-DEX ${sym} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qt.slice(0,6)} | (no WSOL pool → adaptive SOL->${qt.slice(0,6)}->A->SOL)`);
           if (MODE === 'dry-run') {
             log(`      ⚪ dry-run: would execute adaptive route via Jupiter`);
             continue;
           }
           try {
             initRouter(connection, wallet);
-            const sigs = await executeAdaptiveRoute({ tokenMint: c.tokenMint, quoteToken: qt, mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined, startLamports });
+            const sigs = await executeAdaptiveRoute({ tokenMint: tk, quoteToken: qt, mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined, startLamports });
             log(`      ✅ CROSS-DEX LIVE done: ${sigs.join(' , ')}`);
             for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
           } catch (e) { fail('cross-dex adaptive', e); }
@@ -845,18 +859,6 @@ async function cycle() {
       log(`      TVL: DLMM=$${route.dlmmPool.tvlUsd.toFixed(0)} | DAMM=$${route.dammPool.tvlUsd.toFixed(0)} (min $${MIN_TVL})`);
       log(`      Vol24h: DLMM=$${route.dlmmPool.volume24h.toFixed(0)} | DAMM=$${route.dammPool.volume24h.toFixed(0)}`);
 
-      // Hard guard: both pools must clear the TVL floor AND have some 24h volume.
-      // (catches stale/low-liquidity pools — TVL alone can be misleading; no volume = dead pool)
-      const tvlFloor = MIN_TVL * 2;
-      if (route.dlmmPool.tvlUsd < tvlFloor || route.dammPool.tvlUsd < tvlFloor) {
-        warn(`      💀 low TVL (DLMM $${route.dlmmPool.tvlUsd.toFixed(0)} / DAMM $${route.dammPool.tvlUsd.toFixed(0)} < $${tvlFloor}) — skip (dead/illiquid pool)`);
-        continue;
-      }
-      if (route.dlmmPool.volume24h <= 0 || route.dammPool.volume24h <= 0) {
-        warn(`      💀 zero volume (DLMM $${route.dlmmPool.volume24h.toFixed(0)} / DAMM $${route.dammPool.volume24h.toFixed(0)}) — skip (dead pool)`);
-        continue;
-      }
-
       // Verify both pools are actually usable (read-only SDK probe).
       // Catches dead/stale pools that slipped past the 20% price filter.
       if (process.env.RPC_URL) {
@@ -875,6 +877,21 @@ async function cycle() {
         warn('      ⚠️ no RPC_URL set — skipping live pool probe (set RPC_URL to verify tradability)');
       }
 
+      // TVL/volume guard. For INTERNAL Meteora candidates (DLMM vs DAMMv2) we need BOTH
+      // venues to clear the floor. For CROSS-DEX candidates (misprice vs Orca/Raydium/Jupiter)
+      // only ONE Meteora pool is required (the other leg is routed via Jupiter).
+      const isCrossDex = !!c.crossDex;
+      const tvlFloor = MIN_TVL * 2;
+      const dlmmOk = route.dlmmPool.tvlUsd >= tvlFloor;
+      const dammOk = route.dammPool.tvlUsd >= tvlFloor;
+      if (isCrossDex ? !(dlmmOk || dammOk) : (!dlmmOk || !dammOk)) {
+        warn(`      💀 low TVL (DLMM $${route.dlmmPool.tvlUsd.toFixed(0)} / DAMM $${route.dammPool.tvlUsd.toFixed(0)} < $${tvlFloor}) — skip (dead/illiquid pool)`);
+        continue;
+      }
+      if (route.dlmmPool.volume24h <= 0 || route.dammPool.volume24h <= 0) {
+        warn(`      💀 zero volume (DLMM $${route.dlmmPool.volume24h.toFixed(0)} / DAMM $${route.dammPool.volume24h.toFixed(0)}) — skip (dead pool)`);
+        continue;
+      }
       if (MODE === 'dry-run') {
         const sim = await dryRun(route);
         if (!sim) { warn('   dry-run estimate failed (price fetch).'); continue; }
