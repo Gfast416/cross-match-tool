@@ -19,7 +19,7 @@ let connection, wallet;
 export function initRouter(conn, wal) { connection = conn; wallet = wal; }
 
 /**
- * Fetch a Jupiter quote for a single hop.
+ * Fetch a Jupiter quote for a single hop, with retry + backoff on rate-limit (429).
  */
 export async function jupQuote(inputMint, outputMint, amount, opts = {}) {
   const params = new URLSearchParams({
@@ -29,9 +29,24 @@ export async function jupQuote(inputMint, outputMint, amount, opts = {}) {
     restrictIntermediateTokens: 'true'
   });
   if (opts.dexes) params.append('dexes', opts.dexes);
-  const res = await fetch(`${JUP_QUOTE}?${params}`);
-  if (!res.ok) throw new Error(`jup quote ${res.status}: ${await res.text()}`);
-  return res.json();
+  let attempt = 0;
+  while (true) {
+    try {
+      const res = await fetch(`${JUP_QUOTE}?${params}`);
+      if (res.status === 429) {
+        attempt++;
+        if (attempt > 4) throw new Error(`jup quote 429: rate limited after retries`);
+        const wait = 1000 * attempt; // 1s, 2s, 3s, 4s
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      if (!res.ok) throw new Error(`jup quote ${res.status}: ${await res.text()}`);
+      return res.json();
+    } catch (e) {
+      if (e.message.includes('429')) throw e;
+      throw e;
+    }
+  }
 }
 
 /**
@@ -71,12 +86,15 @@ export async function executeJupiterSwap(inputMint, outputMint, amount, opts = {
  */
 export async function executeAdaptiveRoute({ tokenMint, quoteToken, mispriceVenueDexes, startLamports }) {
   const sigs = [];
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   // hop1: SOL -> quote
   const h1 = await executeJupiterSwap(WSOL, quoteToken, startLamports, { dexes: undefined });
   sigs.push(h1.sig);
+  await sleep(1200); // throttle to avoid Jupiter 429
   // hop2: quote -> A (force the mispriced venue)
   const h2 = await executeJupiterSwap(quoteToken, tokenMint, h1.outAmount, { dexes: mispriceVenueDexes });
   sigs.push(h2.sig);
+  await sleep(1200);
   // hop3: A -> SOL
   const h3 = await executeJupiterSwap(tokenMint, WSOL, h2.outAmount, { dexes: undefined });
   sigs.push(h3.sig);

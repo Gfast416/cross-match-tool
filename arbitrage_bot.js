@@ -31,6 +31,11 @@
  */
 
 import 'dotenv/config';
+// Also load .env.bot if present (our documented config file), since `dotenv/config`
+// only auto-loads `.env`. Without this, RPC_URLS / WALLET_PRIVATE_KEY in .env.bot are ignored.
+import { config as dotenvConfig } from 'dotenv';
+try { dotenvConfig({ path: '.env.bot' }); } catch {}
+try { dotenvConfig({ path: '.env' }); } catch {}
 import BN from 'bn.js';
 import { normalizePool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
 import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, USDC as ROUTER_USDC, USDT as ROUTER_USDT } from './router.js';
@@ -230,7 +235,7 @@ async function scanForCandidates() {
         else if (hasTok(realRaw, WSOL_MINT)) quoteToken = WSOL_MINT;
         candidates.push({
           baseMint: cd.tokenMint,
-          name: cd.symbol,
+          symbol: cd.symbol,
           direction: cd.meteoraIsCheap ? 'BUY_METEORA' : 'SELL_METEORA',
           mispricingPct: cd.spreadPct,
           dlmmPool: dlmm || { priceUsd: cd.prices.dlmm || 0, tvlUsd: 0, volume24h: 0, raw: {} },
@@ -929,7 +934,8 @@ async function cycle() {
         }
         log(`      🔍 pool probe OK (both venues tradeable)`);
       } else {
-        warn('      ⚠️ no RPC_URL set — skipping live pool probe (set RPC_URL to verify tradability)');
+        if (c.crossDex) log('      ⏭️ cross-dex route — skipping Meteora probe (routed via Jupiter)');
+        else warn('      ⚠️ no RPC_URL set — skipping live pool probe (set RPC_URLS to verify tradability)');
       }
 
       // TVL/volume guard. For INTERNAL Meteora candidates (DLMM vs DAMMv2) we need BOTH

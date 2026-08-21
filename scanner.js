@@ -650,6 +650,9 @@ async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, o
     const max = Math.max(...vals);
     const spreadPct = ((max - min) / min) * 100;
     if (spreadPct < thresholdPct) continue;
+    // Sanity cap: >1000% spread almost always means a stale/near-zero-price source
+    // (e.g. tiny pool priced at $0.0000001 vs Jupiter). Skip obvious garbage.
+    if (spreadPct > 1000) continue;
 
     let cheapVenue = null, expensiveVenue = null, cheapPrice = Infinity, expensivePrice = -Infinity;
     for (const [venue, price] of Object.entries(prices)) {
