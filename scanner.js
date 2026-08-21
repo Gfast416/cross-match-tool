@@ -242,7 +242,7 @@ async function fetchAllPages(apiName, url, maxPages = 5, pageSize = 500) {
     try {
       const resp = await axios.get(url, {
         params: { page, page_size: pageSize, sort_by: 'tvl:desc' },
-        timeout: 30000,
+        timeout: 8000,
         headers: { 'User-Agent': 'CrossMatchBot/1.0' }
       });
 

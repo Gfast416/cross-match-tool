@@ -172,11 +172,13 @@ async function notify(msg) {
 
 // ---------- Scan: reuse your scanner.js ----------
 async function scanForCandidates() {
+  log('   [scan] fetching Meteora DLMM/DAMMv2 pools...');
   // Fetch Meteora DLMM + DAMMv2 pools in parallel.
   const [dlmmRows, dammRows] = await Promise.all([
-    fetchAllPages('DLMM', DLMM_API, MAX_PAGES),
-    fetchAllPages('DAMM', DAMM_API, MAX_PAGES)
+    fetchAllPages('DLMM', DLMM_API, MAX_PAGES).catch(e => { warn('DLMM fetch failed:', e.message); return []; }),
+    fetchAllPages('DAMM', DAMM_API, MAX_PAGES).catch(e => { warn('DAMM fetch failed:', e.message); return []; })
   ]);
+  log(`   [scan] Meteora: dlmm=${dlmmRows.length} damm=${dammRows.length}`);
 
   const dlmmPoolMap = normalizePool(dlmmRows, 'dlmm', MIN_TVL);
   const dammPoolMap = normalizePool(dammRows, 'damm', MIN_TVL);
