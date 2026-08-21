@@ -413,7 +413,9 @@ async function prepareWsol(lamports) {
     closeTx.recentBlockhash = blockhash;
     await sendAndConfirm(await addFeeOptimization(closeTx, 120_000), 'close stale WSOL ATA');
   }
-  // 2) Recreate WSOL ATA as SPL, then wrap.
+  // 2) Recreate WSOL ATA as SPL, then wrap exactly the trade amount.
+  // The swap takes its fee in WSOL, so we swap slightly less than the wrapped
+  // amount (see inAmount below) to leave room for the DLMM fee.
   const ixs = [
     createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, SPL),
     SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports }),
@@ -541,11 +543,12 @@ async function executeLive(route) {
     const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
     const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
-    const quote = await withTimeout(dlmmPool.swapQuote(new BN(lamports), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1');
+    const inLamports = lamports - 100_000; // leave WSOL for the DLMM fee
+    const quote = await withTimeout(dlmmPool.swapQuote(new BN(inLamports), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1');
     let tx = await withTimeout(dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
-      inAmount: new BN(lamports),
+      inAmount: new BN(inLamports),
       lbPair: dlmmPool.pubkey,
       user: wallet.publicKey,
       minOutAmount: quote.minOutAmount,
