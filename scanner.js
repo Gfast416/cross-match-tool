@@ -54,6 +54,7 @@ const METEORA_API = 'https://api.meteora.io/v1/pools';
 const JUPITER_PRICE_API = 'https://price.jup.ag/v4/price';
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 
 // --- GitHub Headers ---
 function ghHeaders() {
@@ -636,6 +637,17 @@ async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, o
     const meteoraInvolved = ('dlmm' in prices) || ('damm' in prices);
     if (!meteoraInvolved) continue;
 
+    // Determine the quote token of the Meteora mispriced pool (WSOL / USDC / USDT)
+    let quoteToken = null;
+    const mp = dlmm || damm;
+    if (mp) {
+      const xs = mp.raw?.token_x?.address || mp.raw?.tokenX?.address || mp.raw?.token_a_mint || '';
+      const ys = mp.raw?.token_y?.address || mp.raw?.tokenY?.address || mp.raw?.token_b_mint || '';
+      if (xs === WSOL_MINT || ys === WSOL_MINT) quoteToken = WSOL_MINT;
+      else if (xs === USDC_MINT || ys === USDC_MINT) quoteToken = USDC_MINT;
+      else if (xs === USDT_MINT || ys === USDT_MINT) quoteToken = USDT_MINT;
+    }
+
     results.push({
       tokenMint: mint,
       symbol: (dlmm?.raw?.name || damm?.raw?.name || mint.slice(0, 6)),
@@ -643,7 +655,8 @@ async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, o
       spreadPct,
       cheapVenue,
       expensiveVenue,
-      meteoraIsCheap: (prices.dlmm && prices.dlmm <= cheapPrice) || (prices.damm && prices.damm <= cheapPrice)
+      meteoraIsCheap: (prices.dlmm && prices.dlmm <= cheapPrice) || (prices.damm && prices.damm <= cheapPrice),
+      quoteToken
     });
   }
   return results;

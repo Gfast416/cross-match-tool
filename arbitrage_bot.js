@@ -33,6 +33,7 @@
 import 'dotenv/config';
 import BN from 'bn.js';
 import { normalizePool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
+import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, USDC as ROUTER_USDC, USDT as ROUTER_USDT } from './router.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
@@ -775,6 +776,32 @@ async function cycle() {
 
     for (const c of candidates) {
       const startLamports = Math.floor(TRADE_AMOUNT_SOL * 1e9);
+
+      // --- Adaptive cross-DEX route: mispriced pool quoted in USDC/USDT (not WSOL) ---
+      // e.g. METEORA USDC-A misprice -> SOL->USDC->A->SOL via Jupiter (dexes restricted to the mispriced venue for hop2).
+      if (c.crossDex && c.crossDex.quoteToken && c.crossDex.quoteToken !== WSOL_MINT) {
+        const qt = c.crossDex.quoteToken === USDC_MINT ? ROUTER_USDC : ROUTER_USDT;
+        log(`\n   🎯 CROSS-DEX ${c.symbol} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qt.slice(0,6)} | cheap=${c.crossDex.cheapVenue}`);
+        try {
+          if (MODE === 'dry-run') {
+            log(`      ⚪ dry-run: would execute adaptive SOL->${qt.slice(0,6)}->${c.tokenMint.slice(0,6)}->SOL via Jupiter`);
+            continue;
+          }
+          initRouter(connection, wallet);
+          const sigs = await executeAdaptiveRoute({
+            tokenMint: c.tokenMint,
+            quoteToken: qt,
+            mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined,
+            startLamports
+          });
+          log(`      ✅ CROSS-DEX LIVE done: ${sigs.join(' , ')}`);
+          for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
+        } catch (e) {
+          fail('cross-dex execute', e);
+        }
+        continue;
+      }
+
       const route = buildRoute(c, startLamports);
       if (!route) continue; // no valid WSOL-entry route (e.g. token has no WSOL pool)
 
