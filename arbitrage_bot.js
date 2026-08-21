@@ -510,6 +510,7 @@ function appendSwapIxs(out, swapTx, label) {
 
 async function executeLive(route) {
   await initLive();
+  const tokenMint = new PublicKey(route.tokenMint);
   const lamports = route.startAmountLamports;
   const allIxs = []; // collect ALL instructions -> one atomic transaction
 
