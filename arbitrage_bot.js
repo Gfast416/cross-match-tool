@@ -249,6 +249,40 @@ async function scanForCandidates() {
     warn(`[scan] cross-dex check failed: ${e.message}`);
   }
 
+  // 3) Single-pool Meteora tokens (only DLMM OR only DAMMv2, not both). These were skipped
+  //    by the internal check (needs both) and may be missed by cross-dex (needs another venue).
+  //    Route them via Jupiter as SOL->A->SOL (the pool's quote token is the transit).
+  try {
+    for (const [mint, dlmmP] of dlmmPoolMap) {
+      if (dammPoolMap.has(mint)) continue; // already handled (internal or cross-dex)
+      if (dlmmP.tvlUsd < MIN_TVL || dlmmP.volume24h <= 0) continue;
+      const raw = dlmmP.raw || {};
+      const xs = raw?.token_x?.address || raw?.tokenX?.address || raw?.token_a_mint || '';
+      const ys = raw?.token_y?.address || raw?.tokenY?.address || raw?.token_b_mint || '';
+      let quoteToken = null;
+      if (xs && xs !== mint) quoteToken = xs; else if (ys && ys !== mint) quoteToken = ys;
+      if (!quoteToken || quoteToken === WSOL_MINT) continue; // need a non-SOL quote to route transit
+      // Only treat as arb if there's a real price gap vs Jupiter (avoid noise)
+      const jp = jupiterPrices[mint];
+      if (jp && dlmmP.priceUsd > 0) {
+        const spread = Math.abs(dlmmP.priceUsd - jp) / jp * 100;
+        if (spread < Math.max(2, MIN_MISPRICING)) continue;
+      }
+      candidates.push({
+        baseMint: mint,
+        symbol: dlmmP.symbol || raw?.name || mint.slice(0, 6),
+        direction: 'BUY_METEORA',
+        mispricingPct: 0,
+        dlmmPool: dlmmP,
+        dammPool: { priceUsd: 0, tvlUsd: 0, volume24h: 0, raw: {} },
+        crossDex: { tokenMint: mint, spreadPct: 0, quoteToken, meteoraIsCheap: true, cheapVenue: 'dlmm' },
+        source: 'single-pool'
+      });
+    }
+  } catch (e) {
+    warn(`[scan] single-pool check failed: ${e.message}`);
+  }
+
   return candidates;
 }
 
@@ -863,6 +897,7 @@ async function cycle() {
             log(`      ⚪ dry-run: would execute adaptive SOL->${qt.slice(0,6)}->${c.tokenMint.slice(0,6)}->SOL via Jupiter`);
             continue;
           }
+          if (!wallet) { warn('      ⚠️ wallet not initialized (check WALLET_PRIVATE_KEY) — skip live cross-dex'); continue; }
           initRouter(getConn(), wallet);
           const sigs = await executeAdaptiveRoute({
             tokenMint: c.tokenMint,
@@ -949,7 +984,13 @@ async function cycle() {
         warn(`      💀 low TVL (DLMM $${route.dlmmPool.tvlUsd.toFixed(0)} / DAMM $${route.dammPool.tvlUsd.toFixed(0)} < $${tvlFloor}) — skip (dead/illiquid pool)`);
         continue;
       }
-      if (route.dlmmPool.volume24h <= 0 || route.dammPool.volume24h <= 0) {
+      // Volume guard. For internal Meteora (both pools) require both >0. For cross-dex/single-pool
+      // only require the pool(s) that actually exist (a stub pool has volume24h=0 by design).
+      const dlmmVolOk = route.dlmmPool.tvlUsd > 0 ? route.dlmmPool.volume24h > 0 : true;
+      const dammVolOk = route.dammPool.tvlUsd > 0 ? route.dammPool.volume24h > 0 : true;
+      if (dlmmVolOk && dammVolOk) {
+        // both existing pools have volume — OK
+      } else {
         warn(`      💀 zero volume (DLMM $${route.dlmmPool.volume24h.toFixed(0)} / DAMM $${route.dammPool.volume24h.toFixed(0)}) — skip (dead pool)`);
         continue;
       }
@@ -1069,6 +1110,18 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
     });
   })();
 } else {
-  cycle();
-  setInterval(cycle, SCAN_INTERVAL_MS);
+  (async () => {
+    if (MODE === 'live') {
+      try {
+        await initLive(); // sets wallet + connections BEFORE any cycle runs
+      } catch (e) {
+        fail('initLive', e);
+        process.exit(1);
+      }
+    } else {
+      try { await initRead(); } catch (e) { warn('initRead skipped: ' + e.message); }
+    }
+    cycle();
+    setInterval(cycle, SCAN_INTERVAL_MS);
+  })();
 }

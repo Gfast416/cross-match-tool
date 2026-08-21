@@ -53,6 +53,8 @@ export async function jupQuote(inputMint, outputMint, amount, opts = {}) {
  * Build + send a Jupiter swap tx. Returns signature.
  */
 export async function executeJupiterSwap(inputMint, outputMint, amount, opts = {}) {
+  if (!wallet || !wallet.publicKey) throw new Error('router wallet not initialized — call initRouter(conn, wallet) after initLive()');
+  if (!connection) throw new Error('router connection not initialized — call initRouter(conn, wallet)');
   const quote = await jupQuote(inputMint, outputMint, amount, opts);
   const res = await fetch(JUP_SWAP, {
     method: 'POST',
