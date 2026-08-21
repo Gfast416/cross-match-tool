@@ -38,14 +38,14 @@ try { dotenvConfig({ path: '.env.bot' }); } catch {}
 try { dotenvConfig({ path: '.env' }); } catch {}
 import BN from 'bn.js';
 import { normalizePool, bestPool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
-import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL } from './router.js';
+import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, quoteSameTokenArb } from './router.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
 // ---------- Config ----------
 const MODE = (process.env.MODE || 'dry-run').toLowerCase();
 const TRADE_AMOUNT_SOL = parseFloat(process.env.TRADE_AMOUNT_SOL || '0.5');
-const MIN_PROFIT_PCT = parseFloat(process.env.MIN_PROFIT_PCT || '1.0');
+const MIN_PROFIT_PCT = parseFloat(process.env.MIN_PROFIT_PCT || '0.3');
 const MIN_TVL = parseFloat(process.env.MIN_TVL || process.argv[2] || '100');
 const MIN_MISPRICING = parseFloat(process.env.MIN_MISPRICING || process.argv[3] || '0.5');
 const ADD_CLOSE_LEG = (process.env.ADD_CLOSE_LEG || 'false').toLowerCase() === 'true';
@@ -912,7 +912,12 @@ async function cycle() {
         log(`\n   🎯 CROSS-DEX ${c.symbol} | spread ${spread.toFixed(2)}% | quote=${qt.slice(0,6)} | cheap=${c.crossDex.cheapVenue}`);
         try {
           if (MODE === 'dry-run') {
-            log(`      ⚪ dry-run: would execute adaptive SOL->${qt.slice(0,6)}->${tk.slice(0,6)}->SOL via Jupiter`);
+            try {
+              const q = await quoteSameTokenArb({ tokenMint: tk, buyVenue: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined, sellVenue: undefined, startLamports });
+              log(`      ⚪ dry-run: SOL->${qt.slice(0,6)}->${tk.slice(0,6)}->SOL net ${q.netPct.toFixed(2)}% (${q.netSol.toFixed(6)} SOL) [Jupiter quote]`);
+            } catch (e) {
+              log(`      ⚪ dry-run: would execute adaptive SOL->${qt.slice(0,6)}->${tk.slice(0,6)}->SOL via Jupiter (quote failed: ${e.message})`);
+            }
             continue;
           }
           if (!wallet) { warn('      ⚠️ wallet not initialized (check WALLET_PRIVATE_KEY) — skip live cross-dex'); continue; }
@@ -1145,7 +1150,16 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
     } else {
       try { await initRead(); } catch (e) { warn('initRead skipped: ' + e.message); }
     }
-    cycle();
-    setInterval(cycle, SCAN_INTERVAL_MS);
+    await cycle();
+    if (MODE !== 'live') return; // dry-run: single pass
+    let running = false;
+    const loop = async () => {
+      if (running) return;
+      running = true;
+      try { await cycle(); } catch (e) { warn(`cycle error: ${e.message}`); }
+      finally { running = false; }
+      setTimeout(loop, SCAN_INTERVAL_MS);
+    };
+    setTimeout(loop, SCAN_INTERVAL_MS);
   })();
 }

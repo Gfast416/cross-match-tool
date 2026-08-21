@@ -129,4 +129,29 @@ export async function executeAdaptiveRoute({ tokenMint, quoteToken, mispriceVenu
   return sigs;
 }
 
+/**
+ * Simulate a same-token arb (buy on buyVenue, sell on sellVenue) using Jupiter quotes.
+ * Used in dry-run to show REAL net profit instead of guessing. Falls back to an unrestricted
+ * route if the venue-restricted one returns NO_ROUTES_FOUND (some tokens have no route on that dex).
+ */
+export async function quoteSameTokenArb({ tokenMint, buyVenue, sellVenue, startLamports, slippageBps = 50 }) {
+  const amt = BigInt(startLamports);
+  const quoteHop = async (inputMint, outputMint, amount, dexes) => {
+    try {
+      return await jupQuote(inputMint, outputMint, amount, { slippageBps, dexes });
+    } catch (e) {
+      if (dexes && /NO_ROUTES_FOUND|400/.test(e.message)) {
+        return await jupQuote(inputMint, outputMint, amount, { slippageBps });
+      }
+      throw e;
+    }
+  };
+  const q1 = await quoteHop(WSOL, tokenMint, amt, buyVenue);
+  const q2 = await quoteHop(tokenMint, WSOL, q1.outAmount, sellVenue);
+  const inSol = Number(amt) / 1e9;
+  const outSol = Number(q2.outAmount) / 1e9;
+  const netPct = ((outSol - inSol) / inSol) * 100;
+  return { inSol, outSol, netPct, netSol: outSol - inSol, q1, q2 };
+}
+
 export { WSOL, USDC, USDT };
