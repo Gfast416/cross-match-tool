@@ -83,10 +83,15 @@ async function cycle() {
 
   const ranked = [];
   for (const r of results) {
-    if (r.status === 'fulfilled' && r.value.q.netPct >= MIN_PROFIT_PCT) {
-      ranked.push({ ...r.value.opp, quote: r.value.q });
-    } else if (r.status === 'rejected') {
-      dbg(`quote failed: ${r.reason?.message || r.reason}`);
+    if (r.status === 'fulfilled') {
+      const { opp, q } = r.value;
+      if (q.netPct >= MIN_PROFIT_PCT) {
+        ranked.push({ ...opp, quote: q });
+      } else {
+        warn(`   ⚠️ ${opp.symbol} quoted net ${q.netPct.toFixed(2)}% < MIN_PROFIT_PCT ${MIN_PROFIT_PCT}% — skip`);
+      }
+    } else {
+      warn(`   ⚠️ quote failed ${r.reason?.message || r.reason}`);
     }
   }
   ranked.sort((a, b) => b.quote.netPct - a.quote.netPct);
