@@ -70,10 +70,22 @@ export async function quoteSameTokenArb({
   tokenMint, buyVenue, sellVenue, amountLamports, slippageBps = 50
 }) {
   const amt = BigInt(amountLamports);
-  // Hop 1: SOL -> token (force buy venue)
-  const q1 = await jupiterQuote(WSOL_MINT, tokenMint, amt, { slippageBps, dexes: buyVenue });
-  // Hop 2: token -> SOL (force sell venue)
-  const q2 = await jupiterQuote(tokenMint, WSOL_MINT, q1.outAmount, { slippageBps, dexes: sellVenue });
+  // Try with venue restriction first (to honor the detected mispriced venue), but fall back
+  // to an unrestricted route if Jupiter can't find one on that specific dex (NO_ROUTES_FOUND).
+  const quoteHop = async (inputMint, outputMint, amount, dexes) => {
+    try {
+      return await jupiterQuote(inputMint, outputMint, amount, { slippageBps, dexes });
+    } catch (e) {
+      if (dexes && /NO_ROUTES_FOUND|400/.test(e.message)) {
+        return await jupiterQuote(inputMint, outputMint, amount, { slippageBps }); // unrestricted retry
+      }
+      throw e;
+    }
+  };
+  // Hop 1: SOL -> token (buy on cheap venue)
+  const q1 = await quoteHop(WSOL_MINT, tokenMint, amt, buyVenue);
+  // Hop 2: token -> SOL (sell on pricey venue)
+  const q2 = await quoteHop(tokenMint, WSOL_MINT, q1.outAmount, sellVenue);
 
   const inSol = Number(amt) / 1e9;
   const outSol = Number(q2.outAmount) / 1e9;
