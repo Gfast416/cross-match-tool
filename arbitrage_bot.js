@@ -805,5 +805,39 @@ async function cycle() {
 console.log('🤖 Meteora DLMM⇄DAMMv2 Arbitrage Bot');
 console.log(`   MODE=${MODE} | scan every ${SCAN_INTERVAL_MS / 1000}s | trade ${TRADE_AMOUNT_SOL} SOL`);
 console.log(`   close-leg(USDC→SOL)=${ADD_CLOSE_LEG} | minProfit=${MIN_PROFIT_PCT}%`);
-cycle();
-setInterval(cycle, SCAN_INTERVAL_MS);
+
+// TEST MODE: force a single MET (DLMM->DAMMv2) live swap to verify end-to-end.
+// Usage: node arbitrage_bot.js test   |   or set TEST_MET=1
+if (process.argv.includes('test') || process.env.TEST_MET === '1') {
+  (async () => {
+    try {
+      const MET = 'METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL';
+      // Build a fake candidate with the real MET pools from the live API.
+      const [dlmmRows, dammRows] = await Promise.all([
+        fetchAllPages('DLMM', DLMM_API, MAX_PAGES),
+        fetchAllPages('DAMM', DAMM_API, MAX_PAGES)
+      ]);
+      const dlmmPoolMap = normalizePool(dlmmRows, 'dlmm', MIN_TVL);
+      const dammPoolMap = normalizePool(dammRows, 'damm', MIN_TVL);
+      if (!dlmmPoolMap.has(MET) || !dammPoolMap.has(MET)) {
+        warn('TEST: MET pool missing from one venue — cannot test. dlmm?', dlmmPoolMap.has(MET), 'damm?', dammPoolMap.has(MET));
+        process.exit(1);
+      }
+      const cand = { baseMint: MET, direction: 'BUY_A_SELL_B', mispricingPct: 99, dlmmPool: dlmmPoolMap.get(MET), dammPool: dammPoolMap.get(MET) };
+      const route = buildRoute(cand, Math.floor(TRADE_AMOUNT_SOL * 1e9));
+      if (!route) { warn('TEST: no valid WSOL route for MET'); process.exit(1); }
+      log(`\n🧪 TEST MODE — forced ${route.leg1Venue}->${route.leg2Venue} (MET), ${TRADE_AMOUNT_SOL} SOL`);
+      log(`   Route: SOL→${MET.slice(0,6)} (${route.leg1Venue}) → ${MET.slice(0,6)} (${route.leg2Venue}) → USDC`);
+      const res = await executeLive(route);
+      log(`   ✅ TEST swap done (${res.venue}): ${res.sigs.join(' , ')}`);
+      for (const s of res.sigs) log(`   https://solscan.io/tx/${s}`);
+      process.exit(0);
+    } catch (e) {
+      fail('TEST swap', e);
+      process.exit(1);
+    }
+  })();
+} else {
+  cycle();
+  setInterval(cycle, SCAN_INTERVAL_MS);
+}
