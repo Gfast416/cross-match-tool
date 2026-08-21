@@ -32,7 +32,7 @@
 
 import 'dotenv/config';
 import BN from 'bn.js';
-import { normalizePool, findCandidates, fetchAllPages } from './scanner.js';
+import { normalizePool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
@@ -136,6 +136,7 @@ async function notify(msg) {
 
 // ---------- Scan: reuse your scanner.js ----------
 async function scanForCandidates() {
+  // Fetch Meteora DLMM + DAMMv2 pools in parallel.
   const [dlmmRows, dammRows] = await Promise.all([
     fetchAllPages('DLMM', DLMM_API, MAX_PAGES),
     fetchAllPages('DAMM', DAMM_API, MAX_PAGES)
@@ -144,16 +145,63 @@ async function scanForCandidates() {
   const dlmmPoolMap = normalizePool(dlmmRows, 'dlmm', MIN_TVL);
   const dammPoolMap = normalizePool(dammRows, 'damm', MIN_TVL);
 
-  const commonTokens = [...dlmmPoolMap.keys()].filter(m => dammPoolMap.has(m));
+  // --- Additional cross-DEX price sources for WIDER mispricing coverage ---
+  // (Raydium, Orca, Jupiter aggregate) — a token can be fairly priced inside Meteora
+  // but heavily mispriced vs other venues; that gap is arbitrageable via Meteora legs.
+  const [raydiumPools, orcaPools] = await Promise.all([
+    fetchRaydiumPools().catch(() => []),
+    fetchOrcaPools().catch(() => [])
+  ]);
+  const allMints = [...new Set([...dlmmPoolMap.keys(), ...dammPoolMap.keys()])];
+  const jupiterPrices = await fetchJupiterPrices(allMints).catch(() => ({}));
+
   const candidates = [];
 
+  // 1) Internal Meteora check: DLMM vs DAMMv2 for the same token.
+  const commonTokens = [...dlmmPoolMap.keys()].filter(m => dammPoolMap.has(m));
   for (const mint of commonTokens) {
     const dlmmPool = dlmmPoolMap.get(mint);
     const dammPool = dammPoolMap.get(mint);
-    const jupiterPrice = await fetchTokenPrice(mint);
+    const jupiterPrice = jupiterPrices[mint] || await fetchTokenPrice(mint);
     const c = findCandidates(dlmmPool, dammPool, jupiterPrice, MIN_MISPRICING);
-    if (c) candidates.push({ ...c, dlmmPool, dammPool });
+    if (c) candidates.push({ ...c, dlmmPool, dammPool, source: 'meteora-internal' });
   }
+
+  // 2) Cross-DEX check: same token priced differently across Meteora/Raydium/Orca/Jupiter.
+  try {
+    const crossDex = await findCrossDexMisprice(
+      { dlmm: dlmmPoolMap, damm: dammPoolMap },
+      jupiterPrices,
+      raydiumPools,
+      orcaPools,
+      Math.max(2, MIN_MISPRICING) // report spreads >=2%
+    );
+    for (const cd of crossDex) {
+      // Only keep ones where Meteora is on the cheap side (buy on Meteora) OR
+      // where Meteora DLMM vs DAMMv2 itself diverges (already covered above).
+      const dlmm = dlmmPoolMap.get(cd.tokenMint);
+      const damm = dammPoolMap.get(cd.tokenMint);
+      if (dlmm && damm) {
+        // Meteora-internal already handled; skip to avoid duplicate.
+        continue;
+      }
+      if (dlmm || damm) {
+        candidates.push({
+          baseMint: cd.tokenMint,
+          name: cd.symbol,
+          direction: cd.meteoraIsCheap ? 'BUY_METEORA' : 'SELL_METEORA',
+          mispricingPct: cd.spreadPct,
+          dlmmPool: dlmm || { priceUsd: cd.prices.dlmm || 0, tvlUsd: 0, volume24h: 0, raw: {} },
+          dammPool: damm || { priceUsd: cd.prices.damm || 0, tvlUsd: 0, volume24h: 0, raw: {} },
+          crossDex: cd,
+          source: 'cross-dex'
+        });
+      }
+    }
+  } catch (e) {
+    warn(`[scan] cross-dex check failed: ${e.message}`);
+  }
+
   return candidates;
 }
 

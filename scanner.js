@@ -570,6 +570,86 @@ function findCandidates(poolA, poolB, jupiterPrice, minMispricingPct = 1.0) {
 }
 
 /**
+ * Cross-DEX mispricing detection — compares the SAME token's price across multiple venues
+ * (Meteora DLMM, Meteora DAMMv2, Raydium, Orca, Jupiter aggregate) and reports any venue
+ * whose price deviates beyond `thresholdPct` from the cross-venue min.
+ *
+ * Broadens coverage far beyond the internal DLMM-vs-DAMMv2 check: a token may be fairly
+ * priced inside Meteora but heavily mispriced vs Raydium/Orca/Jupiter — that gap is arbitrageable
+ * by routing through Meteora (buy cheap venues token on Meteora, sell on the expensive one).
+ *
+ * @param {Object} meteoraPools - { dlmm: Map<mint, pool>, damm: Map<mint, pool> } from normalizePool
+ * @param {Object} jupiterPrices - mint -> price (from fetchJupiterPrices)
+ * @param {Array} raydiumPools - raw Raydium pools (from fetchRaydiumPools)
+ * @param {Array} orcaPools - raw Orca whirlpools (from fetchOrcaPools)
+ * @param {number} thresholdPct - min cross-venue spread % to report (e.g. 3)
+ * @returns {Array<Object>} candidates
+ */
+async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, orcaPools, thresholdPct = 3) {
+  const rayMap = new Map();
+  for (const p of (raydiumPools || [])) {
+    const mint = p.tokenMint || p.id || p.mint;
+    const price = Number(p.price || p.tokenPrice || 0);
+    if (mint && price > 0) rayMap.set(mint, price);
+  }
+  const orcaMap = new Map();
+  for (const w of (orcaPools || [])) {
+    const mint = w.tokenMintA || w.tokenAMint || w.token0Mint;
+    const price = Number(w.tokenPrice || 0);
+    if (mint && price > 0) orcaMap.set(mint, price);
+  }
+
+  const results = [];
+  const allMints = new Set([
+    ...meteoraPools.dlmm.keys(),
+    ...meteoraPools.damm.keys(),
+    ...rayMap.keys(),
+    ...orcaMap.keys(),
+    ...Object.keys(jupiterPrices || {})
+  ]);
+
+  for (const mint of allMints) {
+    const prices = {};
+    const dlmm = meteoraPools.dlmm.get(mint);
+    const damm = meteoraPools.damm.get(mint);
+    if (dlmm) prices.dlmm = Number(dlmm.priceUsd || 0);
+    if (damm) prices.damm = Number(damm.priceUsd || 0);
+    if (rayMap.has(mint)) prices.raydium = rayMap.get(mint);
+    if (orcaMap.has(mint)) prices.orca = orcaMap.get(mint);
+    if (jupiterPrices && jupiterPrices[mint]) prices.jupiter = jupiterPrices[mint];
+
+    const vals = Object.values(prices).filter(v => v > 0);
+    if (vals.length < 2) continue;
+
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const spreadPct = ((max - min) / min) * 100;
+    if (spreadPct < thresholdPct) continue;
+
+    let cheapVenue = null, expensiveVenue = null, cheapPrice = Infinity, expensivePrice = -Infinity;
+    for (const [venue, price] of Object.entries(prices)) {
+      if (price <= 0) continue;
+      if (price < cheapPrice) { cheapPrice = price; cheapVenue = venue; }
+      if (price > expensivePrice) { expensivePrice = price; expensiveVenue = venue; }
+    }
+
+    const meteoraInvolved = ('dlmm' in prices) || ('damm' in prices);
+    if (!meteoraInvolved) continue;
+
+    results.push({
+      tokenMint: mint,
+      symbol: (dlmm?.raw?.name || damm?.raw?.name || mint.slice(0, 6)),
+      prices,
+      spreadPct,
+      cheapVenue,
+      expensiveVenue,
+      meteoraIsCheap: (prices.dlmm && prices.dlmm <= cheapPrice) || (prices.damm && prices.damm <= cheapPrice)
+    });
+  }
+  return results;
+}
+
+/**
  * Generate cross-match report
  * @param {Array<Object>} matches
  */
@@ -622,7 +702,7 @@ async function runFilterPipeline(rawPairs) {
 }
 
 // Export for programmatic use
-export { filterLayer1, filterLayer2, filterLayer3, runFullScan, runFilterPipeline, fetchRaydiumPools, fetchOrcaPools, fetchMeteoraPools, fetchJupiterPrices, uploadFile, createRepo, repoExists, retry, normalizePool, findCandidates, generateReport, fetchAllPages };
+export { filterLayer1, filterLayer2, filterLayer3, runFullScan, runFilterPipeline, fetchRaydiumPools, fetchOrcaPools, fetchMeteoraPools, fetchJupiterPrices, uploadFile, createRepo, repoExists, retry, normalizePool, findCandidates, generateReport, fetchAllPages, findCrossDexMisprice };
 
 // Run main if this file is executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
