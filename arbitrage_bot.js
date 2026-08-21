@@ -186,12 +186,16 @@ async function scanForCandidates() {
   // --- Additional cross-DEX price sources for WIDER mispricing coverage ---
   // (Raydium, Orca, Jupiter aggregate) — a token can be fairly priced inside Meteora
   // but heavily mispriced vs other venues; that gap is arbitrageable via Meteora legs.
+  log('   [scan] fetching Raydium + Orca pools...');
   const [raydiumPools, orcaPools] = await Promise.all([
-    fetchRaydiumPools().catch(() => []),
-    fetchOrcaPools().catch(() => [])
+    fetchRaydiumPools().catch(e => { warn('Raydium fetch failed:', e.message); return []; }),
+    fetchOrcaPools().catch(e => { warn('Orca fetch failed:', e.message); return []; })
   ]);
-  const allMints = [...new Set([...dlmmPoolMap.keys(), ...dammPoolMap.keys()])];
-  const jupiterPrices = await fetchJupiterPrices(allMints).catch(() => ({}));
+  log(`   [scan] Raydium: ${raydiumPools.length} | Orca: ${orcaPools.length}`);
+  log('   [scan] fetching Jupiter USD prices...');
+  const allMints = [...new Set([...dlmmPoolMap.keys(), ...dammPoolMap.keys(), ...raydiumPools.map(p=>p.tokenMint||p.mintA), ...orcaPools.map(p=>p.tokenMint||p.mintA)])];
+  const jupiterPrices = await fetchJupiterPrices(allMints).catch(e => { warn('Jupiter prices failed:', e.message); return {}; });
+  log(`   [scan] Jupiter prices: ${Object.keys(jupiterPrices).length} mints`);
 
   const candidates = [];
 
