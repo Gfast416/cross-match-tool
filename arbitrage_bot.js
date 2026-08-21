@@ -737,14 +737,16 @@ async function verifyPoolUsable(route) {
   try {
     // Probe Leg-1 pool (SOL/WSOL side)
     log(`      🔎 probing leg1 (${route.leg1Venue})...`);
-    if (route.leg1IsDlmm) {
-      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
+    const leg1Addr = route.leg1Pool?.raw?.address;
+    if (!leg1Addr) { log(`      ⚠️ leg1 raw.address missing — skip probe`); }
+    else if (route.leg1IsDlmm) {
+      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(leg1Addr), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
       const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT);
       const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
       await withTimeout(dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1'); // tiny amount, read-only
     } else {
       const cpAmm = new CpAmm(connection);
-      const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address)), 20000, 'fetchPoolState leg1');
+      const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(leg1Addr)), 20000, 'fetchPoolState leg1');
       await withTimeout(cpAmm.getQuote({
         inAmount: new BN(1e6), inputTokenMint: new PublicKey(WSOL_MINT),
         slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
@@ -754,16 +756,20 @@ async function verifyPoolUsable(route) {
     }
     log(`      🔎 probing leg2 (${route.leg2Venue})...`);
     // Probe Leg-2 pool (USDC side)
-    if (route.leg2IsDlmm) {
-      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
-      const swapForY = dlmmSwapForY(dlmmPool, route.tokenMint);
+    const leg2Addr = route.leg2Pool?.raw?.address;
+    if (!leg2Addr) { log(`      ⚠️ leg2 raw.address missing — skip probe`); }
+    else if (route.leg2IsDlmm) {
+      const tokenMint = route.baseMint || route.tokenMint;
+      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(leg2Addr), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
+      const swapForY = dlmmSwapForY(dlmmPool, tokenMint);
       const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
       await withTimeout(dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
     } else {
+      const tokenMint = route.baseMint || route.tokenMint;
       const cpAmm = new CpAmm(connection);
-      const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address)), 20000, 'fetchPoolState leg2');
+      const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(leg2Addr)), 20000, 'fetchPoolState leg2');
       await withTimeout(cpAmm.getQuote({
-        inAmount: new BN(1e6), inputTokenMint: new PublicKey(route.tokenMint),
+        inAmount: new BN(1e6), inputTokenMint: new PublicKey(tokenMint),
         slippage: parseFloat(process.env.SLIPPAGE_PCT || '1.0'), poolState: ps,
         currentTime: Math.floor(Date.now() / 1000), currentSlot: 0,
         tokenADecimal: 9, tokenBDecimal: 9
@@ -861,7 +867,8 @@ async function cycle() {
 
       // Verify both pools are actually usable (read-only SDK probe).
       // Catches dead/stale pools that slipped past the 20% price filter.
-      if (process.env.RPC_URL) {
+      // For cross-dex candidates we route via Jupiter (not Meteora SDK swaps), so skip the Meteora probe.
+      if (process.env.RPC_URL && !c.crossDex) {
         const v = await verifyPoolUsable(route);
         if (!v.ok) {
           if (v.fatal) {
