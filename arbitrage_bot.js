@@ -399,23 +399,36 @@ async function addFeeOptimization(tx, estimateCu) {
 async function prepareWsol(lamports) {
   const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
   const SPL = TOKEN_PROGRAM_ID;
-  // 1) If a WSOL ATA already exists, close it (recover lamports) so we can recreate cleanly.
-  let existing;
+  let info = null;
   try {
-    existing = await withTimeout(connection.getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA');
-  } catch { existing = null; }
-  if (existing && existing.data) {
-    const ownerProg = existing.owner; // program that currently owns the ATA
-    const closeIx = createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], ownerProg);
-    const closeTx = new Transaction().add(closeIx);
-    closeTx.feePayer = wallet.publicKey;
-    const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash close-wsol');
-    closeTx.recentBlockhash = blockhash;
-    await sendAndConfirm(await addFeeOptimization(closeTx, 120_000), 'close stale WSOL ATA');
+    info = await withTimeout(connection.getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA');
+  } catch { info = null; }
+
+  if (info && info.data) {
+    // ATA already exists.
+    if (!info.owner.equals(SPL)) {
+      // Corrupt (wrong token program) — close it, then recreate+wrap below.
+      const closeIx = createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], info.owner);
+      const closeTx = new Transaction().add(closeIx);
+      closeTx.feePayer = wallet.publicKey;
+      const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash close-wsol');
+      closeTx.recentBlockhash = blockhash;
+      await sendAndConfirm(await addFeeOptimization(closeTx, 120_000), 'close stale WSOL ATA');
+      // fall through to create+wrap
+    } else {
+      // Healthy SPL ATA already present — just wrap (do NOT recreate, avoids "already in use").
+      const wrapTx = new Transaction().add(
+        SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports }),
+        createSyncNativeInstruction(ata, SPL)
+      );
+      wrapTx.feePayer = wallet.publicKey;
+      const { blockhash: bh } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash');
+      wrapTx.recentBlockhash = bh;
+      await sendAndConfirm(await addFeeOptimization(wrapTx, 200_000), 'wrap SOL->WSOL');
+      return;
+    }
   }
-  // 2) Recreate WSOL ATA as SPL, then wrap exactly the trade amount.
-  // The swap takes its fee in WSOL, so we swap slightly less than the wrapped
-  // amount (see inAmount below) to leave room for the DLMM fee.
+  // Create ATA (fresh or after close) + wrap in one tx.
   const ixs = [
     createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, SPL),
     SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports }),
@@ -534,6 +547,13 @@ async function executeLive(route) {
   // Pre-create the leg-1 OUTPUT token ATA (separate tx) so the swap's own
   // getOrCreateATAInstruction finds an already-initialized account.
   await ensureAtaSeparate(tokenMint);
+
+  // DEBUG: report WSOL ATA balance right before the swap so a failure is diagnosable.
+  try {
+    const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
+    const wb = await withTimeout(connection.getTokenAccountBalance(wsolAta), RPC_TIMEOUT_MS, 'wsol bal');
+    dbg(`wsol ATA balance=${(wb?.value?.amount || '0')} need>=${lamports - 100_000}`);
+  } catch { /* non-fatal */ }
 
   let sigs = [];
   // ---------- Leg 1: SOL (WSOL) -> token (on the pool that contains WSOL) ----------
