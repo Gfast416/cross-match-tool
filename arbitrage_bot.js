@@ -38,7 +38,7 @@ try { dotenvConfig({ path: '.env.bot' }); } catch {}
 try { dotenvConfig({ path: '.env' }); } catch {}
 import BN from 'bn.js';
 import { normalizePool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
-import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, USDC as ROUTER_USDC, USDT as ROUTER_USDT } from './router.js';
+import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL } from './router.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
@@ -895,7 +895,9 @@ async function cycle() {
       // --- Adaptive cross-DEX route: mispriced pool quoted in USDC/USDT (not WSOL) ---
       // e.g. METEORA USDC-A misprice -> SOL->USDC->A->SOL via Jupiter (dexes restricted to the mispriced venue for hop2).
       if (c.crossDex && c.crossDex.quoteToken && c.crossDex.quoteToken !== WSOL_MINT) {
-        const qt = c.crossDex.quoteToken === USDC_MINT ? ROUTER_USDC : ROUTER_USDT;
+        // Use the REAL quote token of the mispriced Meteora pool — can be USDC, USDT, JUP,
+        // BONK, PUMP, ANY token. Do NOT force USDC/USDT (user: "bisa apa aja").
+        const qt = c.crossDex.quoteToken;
         const tk = c.baseMint || c.tokenMint;
         const spread = c.crossDex.spreadPct || 0;
         // Skip near-zero / noise spreads (e.g. 0.00%) — not a real arb.
