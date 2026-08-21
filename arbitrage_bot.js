@@ -713,9 +713,8 @@ async function verifyPoolUsable(route) {
 
 // ---------- Main loop ----------
 async function cycle() {
-  const ts = new Date().toISOString();
-  log(`\n${'='.repeat(64)}`);
-  log(`[${ts}] 🔄 Scan cycle | MODE=${MODE} | minTVL=$${MIN_TVL} minMis=${MIN_MISPRICING}%`);
+  console.log('='.repeat(64));
+  log(`🔄 Scan cycle | MODE=${MODE} | minTVL=$${MIN_TVL} minMis=${MIN_MISPRICING}%`);
   try {
     const candidates = await scanForCandidates();
     log(`   Found ${candidates.length} mispricing candidate(s)`);
