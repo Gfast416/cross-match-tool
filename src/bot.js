@@ -123,5 +123,15 @@ export async function runPro() {
   }
   await cycle();
   if (MODE !== 'live') return; // dry-run: single pass
-  setInterval(cycle, SCAN_INTERVAL_MS);
+
+  // Recurring loop with a guard so cycles never overlap (store is shared global state).
+  let running = false;
+  const loop = async () => {
+    if (running) return;
+    running = true;
+    try { await cycle(); } catch (e) { warn(`cycle error: ${e.message}`); }
+    finally { running = false; }
+    setTimeout(loop, SCAN_INTERVAL_MS);
+  };
+  setTimeout(loop, SCAN_INTERVAL_MS);
 }
