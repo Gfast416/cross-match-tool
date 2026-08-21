@@ -580,13 +580,13 @@ async function executeLive(route) {
     const inLamports = lamports - 105_000; // wrapAmount(5k buffer) minus DLMM fee room
     const quote = await withTimeout(dlmmPool.swapQuote(new BN(inLamports), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1');
     let tx = await withTimeout(dlmmPool.swap({
-      inToken: dlmmPool.tokenX.publicKey,
+      inToken: swapForY ? dlmmPool.tokenX.publicKey : dlmmPool.tokenY.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
       inAmount: new BN(inLamports),
       lbPair: dlmmPool.pubkey,
       user: wallet.publicKey,
       minOutAmount: quote.minOutAmount,
-      outToken: dlmmPool.tokenY.publicKey
+      outToken: swapForY ? dlmmPool.tokenY.publicKey : dlmmPool.tokenX.publicKey
     }), 25000, 'DLMM.swap leg1');
     tx = await addFeeOptimization(tx, 600_000);
     const sig1 = await sendAndConfirm(tx, 'DLMM swap (leg1)');
