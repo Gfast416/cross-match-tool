@@ -612,16 +612,21 @@ async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, o
   const rayMap = new Map();
   for (const p of (raydiumPools || [])) {
     const mints = p.mints || [p.mintA, p.mintB].filter(Boolean);
-    const price = Number(p.price || 0);
-    if (price <= 0) continue;
-    for (const m of mints) if (m) rayMap.set(m, price);
+    const price = Number(p.price || 0); // A/B ratio, NOT USD
+    if (price <= 0 || mints.length < 2) continue;
+    const [a, b] = mints;
+    // Store ratio for both mints; 'other' is the counterpart used to convert to USD via Jupiter.
+    rayMap.set(a, { ratio: price, other: b, usd: 0 });
+    rayMap.set(b, { ratio: 1 / price, other: a, usd: 0 });
   }
   const orcaMap = new Map();
   for (const w of (orcaPools || [])) {
     const mints = w.mints || [w.mintA, w.mintB].filter(Boolean);
-    const price = Number(w.price || 0);
-    if (price <= 0) continue;
-    for (const m of mints) if (m) orcaMap.set(m, price);
+    const price = Number(w.price || 0); // A/B ratio, NOT USD
+    if (price <= 0 || mints.length < 2) continue;
+    const [a, b] = mints;
+    orcaMap.set(a, { ratio: price, other: b, usd: 0 });
+    orcaMap.set(b, { ratio: 1 / price, other: a, usd: 0 });
   }
 
   const results = [];
@@ -637,21 +642,40 @@ async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, o
     const prices = {};
     const dlmm = meteoraPools.dlmm.get(mint);
     const damm = meteoraPools.damm.get(mint);
+    // Meteora priceUsd is already USD (normalized by Meteora from the quote token).
     if (dlmm) prices.dlmm = Number(dlmm.priceUsd || 0);
     if (damm) prices.damm = Number(damm.priceUsd || 0);
-    if (rayMap.has(mint)) prices.raydium = rayMap.get(mint);
-    if (orcaMap.has(mint)) prices.orca = orcaMap.get(mint);
+    // Raydium/Orca `price` is the A/B ratio (NOT USD) — only usable as USD if the OTHER
+    // token in the pool has a known USD price (from Jupiter). We convert below.
+    if (rayMap.has(mint)) {
+      const p = rayMap.get(mint);
+      if (p.usd) prices.raydium = p.usd;
+      else if (p.ratio && jupiterPrices[p.other]) prices.raydium = p.ratio * jupiterPrices[p.other];
+    }
+    if (orcaMap.has(mint)) {
+      const p = orcaMap.get(mint);
+      if (p.usd) prices.orca = p.usd;
+      else if (p.ratio && jupiterPrices[p.other]) prices.orca = p.ratio * jupiterPrices[p.other];
+    }
+    // Jupiter as the trusted USD oracle for the mispriced token itself.
     if (jupiterPrices && jupiterPrices[mint]) prices.jupiter = jupiterPrices[mint];
 
     const vals = Object.values(prices).filter(v => v > 0);
-    if (vals.length < 2) continue;
+    if (vals.length < 2) {
+      if (DEBUG && (prices.dlmm || prices.damm) && prices.jupiter) {
+        // Meteora + Jupiter present but no 2nd venue — log the raw gap for tuning.
+        const m = prices.dlmm || prices.damm;
+        const gap = Math.abs(m - prices.jupiter) / prices.jupiter * 100;
+        if (gap >= 0.5) console.log(`[xdex] ${mint.slice(0,6)} meteora=${m.toFixed(6)} jup=${prices.jupiter.toFixed(6)} gap=${gap.toFixed(2)}% (no 2nd venue, skipped)`);
+      }
+      continue;
+    }
 
     const min = Math.min(...vals);
     const max = Math.max(...vals);
     const spreadPct = ((max - min) / min) * 100;
     if (spreadPct < thresholdPct) continue;
-    // Sanity cap: >1000% spread almost always means a stale/near-zero-price source
-    // (e.g. tiny pool priced at $0.0000001 vs Jupiter). Skip obvious garbage.
+    // Sanity cap: >1000% spread almost always means a stale/near-zero-price source.
     if (spreadPct > 1000) continue;
 
     let cheapVenue = null, expensiveVenue = null, cheapPrice = Infinity, expensivePrice = -Infinity;

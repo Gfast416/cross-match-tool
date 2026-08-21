@@ -210,7 +210,7 @@ async function scanForCandidates() {
       jupiterPrices,
       raydiumPools,
       orcaPools,
-      Math.max(2, MIN_MISPRICING) // report spreads >=2%
+      Math.max(0.5, MIN_MISPRICING) // report spreads >=0.5% (user-tunable via minMis)
     );
     for (const cd of crossDex) {
       // Only keep ones where Meteora is on the cheap side (buy on Meteora) OR
@@ -248,40 +248,6 @@ async function scanForCandidates() {
     }
   } catch (e) {
     warn(`[scan] cross-dex check failed: ${e.message}`);
-  }
-
-  // 3) Single-pool Meteora tokens (only DLMM OR only DAMMv2, not both). These were skipped
-  //    by the internal check (needs both) and may be missed by cross-dex (needs another venue).
-  //    Route them via Jupiter as SOL->A->SOL (the pool's quote token is the transit).
-  try {
-    for (const [mint, dlmmP] of dlmmPoolMap) {
-      if (dammPoolMap.has(mint)) continue; // already handled (internal or cross-dex)
-      if (dlmmP.tvlUsd < MIN_TVL || dlmmP.volume24h <= 0) continue;
-      const raw = dlmmP.raw || {};
-      const xs = raw?.token_x?.address || raw?.tokenX?.address || raw?.token_a_mint || '';
-      const ys = raw?.token_y?.address || raw?.tokenY?.address || raw?.token_b_mint || '';
-      let quoteToken = null;
-      if (xs && xs !== mint) quoteToken = xs; else if (ys && ys !== mint) quoteToken = ys;
-      if (!quoteToken || quoteToken === WSOL_MINT) continue; // need a non-SOL quote to route transit
-      // Only treat as arb if there's a real price gap vs Jupiter (avoid noise)
-      const jp = jupiterPrices[mint];
-      if (jp && dlmmP.priceUsd > 0) {
-        const spread = Math.abs(dlmmP.priceUsd - jp) / jp * 100;
-        if (spread < Math.max(2, MIN_MISPRICING)) continue;
-      }
-      candidates.push({
-        baseMint: mint,
-        symbol: dlmmP.symbol || raw?.name || mint.slice(0, 6),
-        direction: 'BUY_METEORA',
-        mispricingPct: 0,
-        dlmmPool: dlmmP,
-        dammPool: { priceUsd: 0, tvlUsd: 0, volume24h: 0, raw: {} },
-        crossDex: { tokenMint: mint, spreadPct: 0, quoteToken, meteoraIsCheap: true, cheapVenue: 'dlmm' },
-        source: 'single-pool'
-      });
-    }
-  } catch (e) {
-    warn(`[scan] single-pool check failed: ${e.message}`);
   }
 
   return candidates;
