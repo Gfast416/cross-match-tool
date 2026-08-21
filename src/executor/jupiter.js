@@ -13,24 +13,31 @@ async function executeJupiterSwap(inputMint, outputMint, amount, { dexes = null,
   if (!wallet || !wallet.publicKey) throw new Error('executor wallet not initialized');
   if (!connection) throw new Error('executor connection not initialized');
   const quote = await jupiterQuote(inputMint, outputMint, amount, { slippageBps, dexes });
-  const res = await fetch(JUP_SWAP, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: prioFee
-    })
-  });
+  log(`      → swap ${inputMint.slice(0,4)}→${outputMint.slice(0,4)} quoting done, posting swap...`);
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 15000);
+  let res;
+  try {
+    res = await fetch(JUP_SWAP, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: wallet.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: prioFee
+      }),
+      signal: ctrl.signal
+    });
+  } finally { clearTimeout(t); }
   if (!res.ok) throw new Error(`jup swap ${res.status}: ${await res.text()}`);
   const data = await res.json();
   const tx = VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64'));
   tx.sign([wallet]);
-  // NOTE: skipping simulateTransaction in hot path (free Helius is slow). The quote already
-  // reflects real outAmount; we rely on slippageBps + sendAndConfirm for safety.
+  log(`      → sending tx (${tx.signatures.length} sig)...`);
   const sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
+  log(`      → sent ${sig.slice(0, 12)}..., confirming...`);
   const conf = await connection.confirmTransaction(sig, 'confirmed');
   if (conf.value.err) throw new Error(`confirm err: ${JSON.stringify(conf.value.err)}`);
   return { sig, outAmount: quote.outAmount };
