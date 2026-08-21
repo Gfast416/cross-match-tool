@@ -8,6 +8,8 @@
 
 import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
 
+const warn = (...a) => console.warn('[router]', ...a);
+
 const WSOL = 'So11111111111111111111111111111111111111112';
 const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
@@ -109,8 +111,21 @@ export async function executeAdaptiveRoute({ tokenMint, quoteToken, mispriceVenu
   sigs.push(h2.sig);
   await sleep(1200);
   // hop3: A -> SOL
-  const h3 = await executeJupiterSwap(tokenMint, WSOL, h2.outAmount, { dexes: undefined });
-  sigs.push(h3.sig);
+  try {
+    const h3 = await executeJupiterSwap(tokenMint, WSOL, h2.outAmount, { dexes: undefined });
+    sigs.push(h3.sig);
+  } catch (e) {
+    // hop3 failed but hop1+hop2 succeeded → token A is stuck in wallet.
+    // Salvage: sell A -> SOL so funds aren't trapped (still a loss from fees, but recoverable).
+    warn(`[cross-dex] hop3 (A->SOL) failed: ${e.message} — attempting salvage sell ${tokenMint.slice(0,6)}->SOL`);
+    try {
+      const h3b = await executeJupiterSwap(tokenMint, WSOL, h2.outAmount, { dexes: undefined, slippageBps: 500 });
+      sigs.push(h3b.sig);
+      warn(`[cross-dex] salvage done: ${h3b.sig}`);
+    } catch (e2) {
+      warn(`[cross-dex] salvage FAILED — token ${tokenMint.slice(0,6)} may be stuck. Manual sell needed. Err: ${e2.message}`);
+    }
+  }
   return sigs;
 }
 

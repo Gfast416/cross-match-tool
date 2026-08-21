@@ -126,6 +126,21 @@ Estimasi total per siklus (2 swap): **~$0.00002–$0.0002** — jauh di bawah pr
 - **Live on-chain belum diuji di mainnet oleh pembuat** — jalankan pertama dengan
   `TRADE_AMOUNT_SOL=0.01` untuk verifikasi end-to-end.
 
+### ⚠️ Atomicity & Risk (JUJUR)
+
+| Route type | Atomic? | Risiko |
+|---|---|---|
+| **Internal Meteora** (DLMM→DAMMv2, WSOL+USDC) | ✅ **YA** — 1 `VersionedTransaction` (v0) berisi wrap + 2 swap + ATA + close. Kalau salah satu instruksi gagal, **seluruh tx revert** (atomicity bawaan Solana). | Aman. |
+| **Cross-DEX** (misprice di pool USDC/USDT/JUP/BONK/PUMP, dll) | ⚠️ **TIDAK** — di-route via Jupiter sebagai **3 tx terpisah** (SOL→quote, quote→A, A→SOL). | Kalau hop ke-2 sukses tapi hop ke-3 gagal, **token A nyangkut** di wallet (bisa di-jual manual). Tiap hop sudah di-`simulateTransaction` dulu, tapi bukan 1 tx atomik. |
+
+**Mitigasi cross-DEX (belum diimplementasi)**: gabungkan 3 hop ke **1 Jito bundle** (atomic-sequenced dalam 1 block) — butuh Jito RPC (berbayar tip). Atau compose manual via SDK tiap DEX (Raydium/Orca) jadi 1 `VersionedTransaction`.
+
+### Scope
+
+- **Internal Meteora**: DLMM↔DAMMv2 (WSOL side + USDC side). Butuh **dua-duanya** ada.
+- **Cross-DEX**: deteksi misprice di **Meteora vs Raydium/Orca/Jupiter**. Eksekusi lewat **Jupiter aggregator** (proxy ke Raydium/Orca/Phoenix — jadi "banyak pool" ke-cover sebagai proxy, tapi **belum ada SDK langsung per-DEX**; kalau Jupiter gagal, belum ada fallback SDK lokal).
+- Token quote **BEBAS**: USDC, USDT, WSOL, JUP, BONK, PUMP, apa saja — bot adaptif (gak terpaku USDC/WSOL).
+
 ### ⚠️ Requirement Node.js untuk Mode Live
 
 SDK Meteora (`@meteora-ag/dlmm`, `@meteora-ag/cp-amm-sdk`) butuh **Node.js 18/20** secara

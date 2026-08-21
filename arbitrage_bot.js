@@ -914,6 +914,7 @@ async function cycle() {
           }
           if (!wallet) { warn('      ⚠️ wallet not initialized (check WALLET_PRIVATE_KEY) — skip live cross-dex'); continue; }
           initRouter(getConn(), wallet);
+          log(`      ⚠️ cross-dex = 3 separate Jupiter tx (NOT atomic) — token may stick if hop3 fails`);
           const sigs = await executeAdaptiveRoute({
             tokenMint: tk,
             quoteToken: qt,
