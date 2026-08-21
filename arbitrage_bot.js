@@ -40,7 +40,7 @@ import BN from 'bn.js';
 import { normalizePool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
 import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, USDC as ROUTER_USDC, USDT as ROUTER_USDT } from './router.js';
 
-import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
 // ---------- Config ----------
 const MODE = (process.env.MODE || 'dry-run').toLowerCase();
@@ -623,12 +623,11 @@ async function buildAtaIx(mint) {
   return createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), prog);
 }
 
-async function sendAndConfirm(tx, label) {
+async function sendAndConfirmVersioned(tx, label) {
   let sig;
   try {
-    sig = await getConn().sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
+    sig = await getConn().sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
   } catch (e) {
-    // SendTransactionError carries .logs with the real revert reason.
     throw new Error(`${label} send failed: ${errorDetail(e)}`);
   }
   log(`      📨 ${label} sent: ${sig}`);
@@ -813,16 +812,40 @@ async function executeLive(route) {
   const closeIx = await buildCloseWsolIx();
   if (closeIx) allIxs.push(...closeIx);
 
-  // ---- Build ONE atomic transaction from all collected instructions ----
-  const bigTx = new Transaction();
-  bigTx.add(...allIxs);
-  bigTx.feePayer = wallet.publicKey;
-  const { blockhash } = await withTimeout(getConn().getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash atomic');
-  bigTx.recentBlockhash = blockhash;
-  // High CU limit for the combined tx (wrap + 2 swaps + ATAs + close).
-  bigTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
-  bigTx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
-  const sig = await sendAndConfirm(bigTx, 'ATOMIC swap (leg1+leg2)');
+  // ---- Build ONE atomic versioned transaction from all collected instructions ----
+  const microPrio = await getPriorityFeeMicroLamports(); // dynamic (Helius Min), free
+  const computeIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
+  const prioIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: microPrio || 50_000 });
+  const allIxsFinal = [computeIx, prioIx, ...allIxs];
+
+  const { blockhash, lastValidBlockHeight } = await withTimeout(
+    getConn().getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash atomic'
+  );
+  const messageV0 = new TransactionMessage({
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+    instructions: allIxsFinal,
+  }).compileToV0Message(); // v0 (supports ALT); we don't need a lookup table for a 2-hop route
+  const bigTx = new VersionedTransaction(messageV0);
+  bigTx.sign([wallet]);
+
+  // PRO guard: simulate BEFORE paying. Catches reverts (price moved, slippage, bad mint)
+  // without burning SOL. Free RPC call.
+  try {
+    const sim = await withTimeout(getConn().simulateTransaction(bigTx), RPC_TIMEOUT_MS, 'simulate atomic');
+    if (sim.value.err) {
+      const reason = JSON.stringify(sim.value.err);
+      const logs = (sim.value.logs || []).slice(-6).join('\n');
+      warn(`      🛑 simulate FAILED (skip, no SOL burned): ${reason}\n${logs}`);
+      return [];
+    }
+    const cu = sim.value.unitsConsumed || 0;
+    dbg(`simulate OK — unitsConsumed=${cu}`);
+  } catch (e) {
+    warn(`      ⚠️ simulate error (proceeding anyway): ${e.message}`);
+  }
+
+  const sig = await sendAndConfirmVersioned(bigTx, 'ATOMIC swap (leg1+leg2)');
   sigs.push(sig);
   return { sent: true, venue: `${route.leg1Venue}→${route.leg2Venue}`, sigs };
 }

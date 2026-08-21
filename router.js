@@ -72,6 +72,17 @@ export async function executeJupiterSwap(inputMint, outputMint, amount, opts = {
   const txBuf = Buffer.from(data.swapTransaction, 'base64');
   const tx = (await import('@solana/web3.js')).VersionedTransaction.deserialize(txBuf);
   tx.sign([wallet]);
+  // PRO guard: simulate before paying (free). Catches reverts without burning SOL.
+  try {
+    const sim = await connection.simulateTransaction(tx);
+    if (sim.value.err) {
+      const logs = (sim.value.logs || []).slice(-6).join('\n');
+      throw new Error(`jup swap simulate FAILED: ${JSON.stringify(sim.value.err)}\n${logs}`);
+    }
+  } catch (e) {
+    if (e.message.includes('simulate FAILED')) throw e;
+    // simulate may be unsupported on some RPC; proceed.
+  }
   const sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
   const conf = await connection.confirmTransaction(sig, 'confirmed');
   if (conf.value.err) throw new Error(`jup swap confirm err: ${JSON.stringify(conf.value.err)}`);
