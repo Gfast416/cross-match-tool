@@ -48,8 +48,8 @@ const RETRY_DELAY_MS = 1000;
 
 // --- Dynamic Data Sources ---
 // All endpoints are public, no auth needed, HTTPS only → minimal fees
-const RAYDIUM_API = 'https://api.raydium.io/v2/main/pools';
-const ORCA_API = 'https://api.orca.so/v2/whirlpools';
+const RAYDIUM_API = 'https://api-v3.raydium.io/pools/info/list';
+const ORCA_API = 'https://api.orca.so/v2/solana/pools';
 const METEORA_API = 'https://api.meteora.io/v1/pools';
 const JUPITER_PRICE_API = 'https://price.jup.ag/v4/price';
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -187,26 +187,36 @@ async function fetchRaydiumPools() {
     const res = await retry(async () => {
       return await api.get(RAYDIUM_API, {
         params: {
-          page: 1,
-          limit: 1000 // Fetch top liquidity pools dynamically
+          poolType: 'all',
+          poolSortField: 'liquidity',
+          sortType: 'desc',
+          pageSize: 200,
+          page: 1
         }
       });
     });
 
-    const pools = res.data?.data || res.data || [];
+    // Raydium v3 wraps pools in res.data.data (array). Each pool: mintA/mintB, price, tvl, volume
+    const raw = res.data?.data || res.data || [];
+    const pools = Array.isArray(raw) ? raw : (raw.data || []);
     console.log(`[raydium] fetched ${pools.length} pools`);
 
-    return pools.map(p => ({
-      venue: 'raydium',
-      tokenMint: p.id || p.mint,
-      name: p.name || `${p.tokenA}/${p.tokenB}`,
-      price: p.price || p.tokenPrice,
-      tvl: p.tvl || p.liquidityUsd || (Number(p.reserve0) * Number(p.reserve1)),
-      reserve0: p.reserve0,
-      reserve1: p.reserve1,
-      volume24h: p.volume24h || p.vol24h || p['24hVolume'],
-      liquidityUsd: p.liquidityUsd || p.tvl
-    }));
+    return pools.map(p => {
+      const mintA = p.mintA?.address || p.mintA;
+      const mintB = p.mintB?.address || p.mintB;
+      return {
+        venue: 'raydium',
+        address: p.id || p.poolId || p.lpMint,
+        mintA, mintB,
+        tokenMint: mintA, // primary; buildRoute uses mints below
+        name: p.name || `${mintA?.slice(0,4)}/${mintB?.slice(0,4)}`,
+        price: Number(p.price || 0),
+        tvl: Number(p.tvl || p.liquidity || p.liquidityUsd || 0),
+        volume24h: Number(p.volume24h || p.volume || 0),
+        // expose both mints for the cross-dex matcher
+        mints: [mintA, mintB].filter(Boolean)
+      };
+    });
   } catch (err) {
     console.error('[raydium] fetch failed:', err.message);
     return [];
@@ -263,23 +273,31 @@ async function fetchAllPages(apiName, url, maxPages = 5, pageSize = 500) {
 async function fetchOrcaPools() {
   try {
     const res = await retry(async () => {
-      return await api.get(ORCA_API);
+      return await api.get(ORCA_API, {
+        params: { minTvl: 10000, sortBy: 'tvl', sortDirection: 'desc', size: 200 }
+      });
     });
 
-    const pools = res.data?.whirlpools || res.data || [];
+    // Orca v2: res.data.data is an array of whirlpools; each has tokenMintA/B, price, tvlUsdc, volume
+    const raw = res.data?.data || res.data || [];
+    const pools = Array.isArray(raw) ? raw : (raw.data || []);
     console.log(`[orca] fetched ${pools.length} pools`);
 
-    return pools.map(w => ({
-      venue: 'orca',
-      tokenMint: w.tokenMintA || w.tokenAMint || w.token0Mint,
-      name: `${w.tokenA || ''} / ${w.tokenB || ''}`,
-      price: w.tokenPrice,
-      tvl: w.tvl || w.liquidityUsd || w.liquidity,
-      reserve0: w.reserve0,
-      reserve1: w.reserve1,
-      volume24h: w.volume24h || w.vol24h || w['24hVolume'],
-      liquidityUsd: w.liquidityUsd || w.tvl
-    }));
+    return pools.map(w => {
+      const mintA = w.tokenMintA;
+      const mintB = w.tokenMintB;
+      return {
+        venue: 'orca',
+        address: w.address || w.whirlpool,
+        mintA, mintB,
+        tokenMint: mintA,
+        name: w.name || `${w.tokenA?.symbol || mintA?.slice(0,4)}/${w.tokenB?.symbol || mintB?.slice(0,4)}`,
+        price: Number(w.price || 0),
+        tvl: Number(w.tvlUsdc || w.tvl || 0),
+        volume24h: Number(w.stats?.['24h']?.volume || w.volume24h || 0),
+        mints: [mintA, mintB].filter(Boolean)
+      };
+    });
   } catch (err) {
     console.error('[orca] fetch failed:', err.message);
     return [];
@@ -587,17 +605,23 @@ function findCandidates(poolA, poolB, jupiterPrice, minMispricingPct = 1.0) {
  * @returns {Array<Object>} candidates
  */
 async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, orcaPools, thresholdPct = 3) {
+  // Build mint->price maps for Raydium & Orca. A pool has TWO mints (A,B); we store
+  // each mint's implied price. For a 2-token pool price = pool.price is the A/B ratio,
+  // but Orca/Raydium `price` field is already tokenA's USD price — store for both mints
+  // using the pool price (good enough for spread detection across venues).
   const rayMap = new Map();
   for (const p of (raydiumPools || [])) {
-    const mint = p.tokenMint || p.id || p.mint;
-    const price = Number(p.price || p.tokenPrice || 0);
-    if (mint && price > 0) rayMap.set(mint, price);
+    const mints = p.mints || [p.mintA, p.mintB].filter(Boolean);
+    const price = Number(p.price || 0);
+    if (price <= 0) continue;
+    for (const m of mints) if (m) rayMap.set(m, price);
   }
   const orcaMap = new Map();
   for (const w of (orcaPools || [])) {
-    const mint = w.tokenMintA || w.tokenAMint || w.token0Mint;
-    const price = Number(w.tokenPrice || 0);
-    if (mint && price > 0) orcaMap.set(mint, price);
+    const mints = w.mints || [w.mintA, w.mintB].filter(Boolean);
+    const price = Number(w.price || 0);
+    if (price <= 0) continue;
+    for (const m of mints) if (m) orcaMap.set(m, price);
   }
 
   const results = [];

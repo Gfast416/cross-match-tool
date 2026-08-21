@@ -803,7 +803,26 @@ async function cycle() {
       }
 
       const route = buildRoute(c, startLamports);
-      if (!route) continue; // no valid WSOL-entry route (e.g. token has no WSOL pool)
+      if (!route) {
+        // No WSOL-entry route (token has no WSOL pool in Meteora). Try adaptive transit
+        // via Jupiter: SOL->USDC->A->SOL (only if token has a Meteora pool to capture misprice).
+        const inMeteora = c.dlmmPool || c.dammPool;
+        if (inMeteora && c.crossDex && c.crossDex.quoteToken && c.crossDex.quoteToken !== WSOL_MINT) {
+          const qt = c.crossDex.quoteToken === USDC_MINT ? ROUTER_USDC : ROUTER_USDT;
+          log(`\n   🎯 CROSS-DEX ${c.symbol} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qt.slice(0,6)} | (no WSOL pool → adaptive SOL->${qt.slice(0,6)}->A->SOL)`);
+          if (MODE === 'dry-run') {
+            log(`      ⚪ dry-run: would execute adaptive route via Jupiter`);
+            continue;
+          }
+          try {
+            initRouter(connection, wallet);
+            const sigs = await executeAdaptiveRoute({ tokenMint: c.tokenMint, quoteToken: qt, mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined, startLamports });
+            log(`      ✅ CROSS-DEX LIVE done: ${sigs.join(' , ')}`);
+            for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
+          } catch (e) { fail('cross-dex adaptive', e); }
+        }
+        continue;
+      }
 
       // Skip noise: pools whose base token is one of our quote/input tokens
       // (e.g. SOL-USDT where the "token" is WSOL itself — an absurd route).
