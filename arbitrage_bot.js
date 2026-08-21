@@ -370,6 +370,11 @@ async function getPriorityFeeMicroLamports() {
 
 // Tighten CU limit per tx; swap is ~250k-1M CU depending on venue.
 async function addFeeOptimization(tx, estimateCu) {
+  // Skip if the tx already carries a ComputeBudget instruction (e.g. DLMM.swap adds its own),
+  // otherwise we'd emit a duplicate ComputeUnitLimit and the tx is rejected.
+  const hasCu = tx.instructions.some(ix =>
+    ix.programId && ix.programId.equals(ComputeBudgetProgram.programId));
+  if (hasCu) return tx;
   const micro = await getPriorityFeeMicroLamports();
   const ixs = [];
   ixs.push(
