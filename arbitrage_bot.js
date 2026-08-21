@@ -48,6 +48,36 @@ const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '30000', 10);
 const MAX_PAGES = parseInt(process.env.MAX_PAGES || '5', 10); // match cross_match.js (2500 pools/venue)
 const RPC_TIMEOUT_MS = parseInt(process.env.RPC_TIMEOUT_MS || '20000', 10);
 
+// ---------- Multi-RPC pool (Helius free rotation to avoid rate limits) ----------
+// Configure via env:
+//   RPC_URLS="https://first.helius-rpc.com,https://second.helius-rpc.com,https://third.helius-rpc.com"
+//   (comma-separated, no spaces). Falls back to RPC_URL if RPC_URLS is unset.
+// The pool rotates endpoints round-robin on every connection request so a single
+// free-tier RPC's rate limit is spread across all of them.
+const RPC_LIST = (process.env.RPC_URLS || process.env.RPC_URL || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+let rpcCursor = 0;
+const rpcFailStreak = new Map(); // endpoint -> consecutive failures
+function rpcEndpoints() { return RPC_LIST.length ? RPC_LIST : [process.env.RPC_URL]; }
+function nextRpcEndpoint() {
+  const list = rpcEndpoints();
+  // round-robin, but skip endpoints with a long failure streak
+  for (let i = 0; i < list.length; i++) {
+    const idx = (rpcCursor + i) % list.length;
+    if ((rpcFailStreak.get(list[idx]) || 0) < 3) {
+      rpcCursor = (idx + 1) % list.length;
+      return list[idx];
+    }
+  }
+  // all flagged; reset and return round-robin anyway
+  rpcCursor = (rpcCursor + 1) % list.length;
+  return list[rpcCursor === 0 ? list.length - 1 : rpcCursor - 1];
+}
+function markRpcSuccess(ep) { rpcFailStreak.set(ep, 0); }
+function markRpcFail(ep) { rpcFailStreak.set(ep, (rpcFailStreak.get(ep) || 0) + 1); }
+
 // Race a promise against a timeout so a slow/stalled Helius free-RPC call can
 // never hang the bot silently (Node's Connection/fetch have NO default timeout).
 async function withTimeout(promise, ms = RPC_TIMEOUT_MS, label = 'rpc') {
@@ -324,24 +354,40 @@ import {
   NATIVE_MINT, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID
 } from '@solana/spl-token';
 
-let connection = null, wallet = null, CpAmm = null, DLMM = null, getTokenProgram = null;
+let connections = {}, lastConn = null, wallet = null, CpAmm = null, DLMM = null, getTokenProgram = null;
+function getConn() {
+  const ep = nextRpcEndpoint();
+  if (!connections[ep]) {
+    connections[ep] = new Connection(ep, {
+      commitment: 'confirmed',
+      confirmTransactionInitialTimeout: RPC_TIMEOUT_MS
+    });
+  }
+  lastConn = connections[ep];
+  return lastConn;
+}
 
 async function initRead() {
-  if (connection) return;
+  if (Object.keys(connections).length) return;
   try {
     const dlmmMod = await import('@meteora-ag/dlmm');
     const cpAmmMod = await import('@meteora-ag/cp-amm-sdk');
     DLMM = dlmmMod.default || dlmmMod.DLMM;
     CpAmm = cpAmmMod.CpAmm || cpAmmMod.default?.CpAmm || cpAmmMod.default;
     getTokenProgram = cpAmmMod.getTokenProgram || (() => TOKEN_PROGRAM_ID);
-    connection = new Connection(process.env.RPC_URL, {
-      commitment: 'confirmed',
-      confirmTransactionInitialTimeout: RPC_TIMEOUT_MS,
-      fetchMiddleware: undefined
-    });
+    // Warm up the connection pool (one Connection per RPC endpoint).
+    for (const ep of rpcEndpoints()) {
+      if (!connections[ep]) {
+        connections[ep] = new Connection(ep, {
+          commitment: 'confirmed',
+          confirmTransactionInitialTimeout: RPC_TIMEOUT_MS
+        });
+      }
+    }
+    lastConn = getConn();
   } catch (e) {
     throw new Error(
-      `Gagal load SDK Meteora (${e.message.split('\n')[0]}).\n` +
+      `Gagal load SDK Meteora (${e.message.split('\\n')[0]}).\n` +
       `Node 22+ (termasuk 26) butuh patch anchor: jalankan \`bash fix_node26.sh\` setelah npm install.\n` +
       `Atau gunakan Node 18/20. Tanpa patch, jalankan tanpa RPC_URL (dry-run aman).`
     );
@@ -351,7 +397,7 @@ async function initRead() {
 async function initLive() {
   if (!process.env.WALLET_PRIVATE_KEY) throw new Error('WALLET_PRIVATE_KEY diperlukan untuk live mode.');
   // connection+SDK may already be set by initRead() (pool probe); only (re)set wallet here.
-  if (!connection) await initRead();
+  if (!Object.keys(connections).length) await initRead();
   if (!wallet) {
     const raw = process.env.WALLET_PRIVATE_KEY.trim();
     let secretBytes;
@@ -414,7 +460,7 @@ async function getPriorityFeeMicroLamports() {
     };
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), RPC_TIMEOUT_MS);
-    const res = await fetch(process.env.RPC_URL, {
+    const res = await fetch(nextRpcEndpoint(), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body), signal: ctrl.signal
     });
@@ -465,7 +511,7 @@ async function buildWrapIx(lamports) {
   const SPL = TOKEN_PROGRAM_ID;
   let info = null;
   try {
-    info = await withTimeout(connection.getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA');
+    info = await withTimeout(getConn().getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA');
   } catch { info = null; }
 
   if (info && info.data) {
@@ -501,12 +547,12 @@ async function buildCloseWsolIx() {
     const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
     let info;
     try {
-      info = await withTimeout(connection.getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA close');
+      info = await withTimeout(getConn().getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA close');
     } catch { return null; }
     if (!info || !info.data) return null;
     let bal = 0n;
     try {
-      const tb = await withTimeout(connection.getTokenAccountBalance(ata), RPC_TIMEOUT_MS, 'getTokenAccountBalance');
+      const tb = await withTimeout(getConn().getTokenAccountBalance(ata), RPC_TIMEOUT_MS, 'getTokenAccountBalance');
       bal = BigInt(tb.value.amount);
     } catch { bal = 0n; }
     dbg(`WSOL ATA close: bal=${bal} owner=${info.owner.toBase58()}`);
@@ -523,7 +569,7 @@ async function buildCloseWsolIx() {
 // Build (do NOT send) an ATA-creation instruction for `mint` if the ATA is missing/uninitialized.
 async function buildAtaIx(mint) {
   const ata = await getAssociatedTokenAddress(new PublicKey(mint), wallet.publicKey);
-  const info = await withTimeout(connection.getAccountInfo(ata), 20000, 'getAccountInfo ATA');
+  const info = await withTimeout(getConn().getAccountInfo(ata), 20000, 'getAccountInfo ATA');
   if (info && info.data) return null; // already exists
   const prog = await getMintProgram(mint);
   return createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), prog);
@@ -532,13 +578,13 @@ async function buildAtaIx(mint) {
 async function sendAndConfirm(tx, label) {
   let sig;
   try {
-    sig = await connection.sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
+    sig = await getConn().sendTransaction(tx, [wallet], { skipPreflight: false, maxRetries: 3 });
   } catch (e) {
     // SendTransactionError carries .logs with the real revert reason.
     throw new Error(`${label} send failed: ${errorDetail(e)}`);
   }
   log(`      📨 ${label} sent: ${sig}`);
-  const conf = await withTimeout(connection.confirmTransaction(sig, 'confirmed'), 30000, `${label} confirm`);
+  const conf = await withTimeout(getConn().confirmTransaction(sig, 'confirmed'), 30000, `${label} confirm`);
   if (conf.value.err) throw new Error(`${label} confirm err: ${JSON.stringify(conf.value.err)}`);
   return sig;
 }
@@ -561,7 +607,7 @@ function dlmmSlippageBps() {
 // wrong program => "Account not associated with this Mint" on swap.
 async function getMintProgram(mint) {
   try {
-    const info = await withTimeout(connection.getAccountInfo(new PublicKey(mint)), 20000, 'getAccountInfo mint');
+    const info = await withTimeout(getConn().getAccountInfo(new PublicKey(mint)), 20000, 'getAccountInfo mint');
     if (info && info.owner) return info.owner; // PublicKey of the token program
   } catch { /* fall through */ }
   return TOKEN_PROGRAM_ID;
@@ -584,7 +630,7 @@ async function executeLive(route) {
 
   // Guard: wrapping needs native SOL = wrapAmount + tx fees, so require a buffer over the trade size.
   try {
-    const bal = await withTimeout(connection.getBalance(wallet.publicKey), RPC_TIMEOUT_MS, 'getBalance');
+    const bal = await withTimeout(getConn().getBalance(wallet.publicKey), RPC_TIMEOUT_MS, 'getBalance');
     const needed = lamports + 10_000_000; // trade + ~0.01 SOL buffer for wrap/swap/close fees
     if (bal < needed) {
       warn(`⚠️ wallet SOL=${bal/1e9} < needed ${needed/1e9} SOL — wrap will fail with insufficient funds. Top up wallet.`);
@@ -602,7 +648,7 @@ async function executeLive(route) {
   if (route.leg1IsDlmm) {
     // DLMM does NOT wrap SOL itself — build the wrap instructions here.
     allIxs.push(...await buildWrapIx(lamports));
-    const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
+    const dlmmPool = await withTimeout(DLMM.create(getConn(), new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
     const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
     const inLamports = lamports - 105_000; // wrapAmount(5k buffer) minus DLMM fee room
@@ -619,7 +665,7 @@ async function executeLive(route) {
     appendSwapIxs(allIxs, tx, 'DLMM swap (leg1)');
     var leg1OutAmount = quote.outAmount;
   } else {
-    const cpAmm = new CpAmm(connection);
+    const cpAmm = new CpAmm(getConn());
     const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address)), 20000, 'fetchPoolState leg1');
     const dammQuote = await withTimeout(cpAmm.getQuote({
       inAmount: new BN(lamports),
@@ -659,7 +705,7 @@ async function executeLive(route) {
   const ataIx2 = await buildAtaIx(USDC_MINT);
   if (ataIx2) allIxs.push(ataIx2);
   if (route.leg2IsDlmm) {
-    const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
+    const dlmmPool = await withTimeout(DLMM.create(getConn(), new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
     const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
     const quote = await withTimeout(dlmmPool.swapQuote(leg1OutAmount, swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
@@ -674,7 +720,7 @@ async function executeLive(route) {
     }), 25000, 'DLMM.swap leg2');
     appendSwapIxs(allIxs, tx2, 'DLMM swap (leg2)');
   } else {
-    const cpAmm = new CpAmm(connection);
+    const cpAmm = new CpAmm(getConn());
     const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address)), 20000, 'fetchPoolState leg2');
     const dammQuote2 = await withTimeout(cpAmm.getQuote({
       inAmount: leg1OutAmount,
@@ -717,7 +763,7 @@ async function executeLive(route) {
   const bigTx = new Transaction();
   bigTx.add(...allIxs);
   bigTx.feePayer = wallet.publicKey;
-  const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash atomic');
+  const { blockhash } = await withTimeout(getConn().getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash atomic');
   bigTx.recentBlockhash = blockhash;
   // High CU limit for the combined tx (wrap + 2 swaps + ATAs + close).
   bigTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
@@ -733,19 +779,19 @@ async function executeLive(route) {
 // ("Pool price differs from estimated market price" / >5% away) the SDK throws —
 // we catch it and skip the candidate so we never try to trade a stale pool.
 async function verifyPoolUsable(route) {
-  if (!connection) await initRead(); // read-only: no wallet needed
+  if (!Object.keys(connections).length) await initRead(); // read-only: no wallet needed
   try {
     // Probe Leg-1 pool (SOL/WSOL side)
     log(`      🔎 probing leg1 (${route.leg1Venue})...`);
     const leg1Addr = route.leg1Pool?.raw?.address;
     if (!leg1Addr) { log(`      ⚠️ leg1 raw.address missing — skip probe`); }
     else if (route.leg1IsDlmm) {
-      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(leg1Addr), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
+      const dlmmPool = await withTimeout(DLMM.create(getConn(), new PublicKey(leg1Addr), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
       const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT);
       const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
       await withTimeout(dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1'); // tiny amount, read-only
     } else {
-      const cpAmm = new CpAmm(connection);
+      const cpAmm = new CpAmm(getConn());
       const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(leg1Addr)), 20000, 'fetchPoolState leg1');
       await withTimeout(cpAmm.getQuote({
         inAmount: new BN(1e6), inputTokenMint: new PublicKey(WSOL_MINT),
@@ -760,13 +806,13 @@ async function verifyPoolUsable(route) {
     if (!leg2Addr) { log(`      ⚠️ leg2 raw.address missing — skip probe`); }
     else if (route.leg2IsDlmm) {
       const tokenMint = route.baseMint || route.tokenMint;
-      const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(leg2Addr), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
+      const dlmmPool = await withTimeout(DLMM.create(getConn(), new PublicKey(leg2Addr), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
       const swapForY = dlmmSwapForY(dlmmPool, tokenMint);
       const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
       await withTimeout(dlmmPool.swapQuote(new BN(1e6), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
     } else {
       const tokenMint = route.baseMint || route.tokenMint;
-      const cpAmm = new CpAmm(connection);
+      const cpAmm = new CpAmm(getConn());
       const ps = await withTimeout(cpAmm.fetchPoolState(new PublicKey(leg2Addr)), 20000, 'fetchPoolState leg2');
       await withTimeout(cpAmm.getQuote({
         inAmount: new BN(1e6), inputTokenMint: new PublicKey(tokenMint),
@@ -812,7 +858,7 @@ async function cycle() {
             log(`      ⚪ dry-run: would execute adaptive SOL->${qt.slice(0,6)}->${c.tokenMint.slice(0,6)}->SOL via Jupiter`);
             continue;
           }
-          initRouter(connection, wallet);
+          initRouter(getConn(), wallet);
           const sigs = await executeAdaptiveRoute({
             tokenMint: c.tokenMint,
             quoteToken: qt,
@@ -845,7 +891,7 @@ async function cycle() {
             continue;
           }
           try {
-            initRouter(connection, wallet);
+            initRouter(getConn(), wallet);
             const sigs = await executeAdaptiveRoute({ tokenMint: tk, quoteToken: qtRaw, mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined, startLamports });
             log(`      ✅ CROSS-DEX LIVE done: ${sigs.join(' , ')}`);
             for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
@@ -870,7 +916,7 @@ async function cycle() {
       // Verify both pools are actually usable (read-only SDK probe).
       // Catches dead/stale pools that slipped past the 20% price filter.
       // For cross-dex candidates we route via Jupiter (not Meteora SDK swaps), so skip the Meteora probe.
-      if (process.env.RPC_URL && !c.crossDex) {
+      if (rpcEndpoints().length && !c.crossDex) {
         const v = await verifyPoolUsable(route);
         if (!v.ok) {
           if (v.fatal) {
@@ -912,7 +958,7 @@ async function cycle() {
           log(`      ⚪ below min profit (${MIN_PROFIT_PCT}%) — skip`);
         }
       } else if (MODE === 'live') {
-        if (!process.env.WALLET_PRIVATE_KEY || !process.env.RPC_URL) {
+        if (!process.env.WALLET_PRIVATE_KEY || !rpcEndpoints().length) {
           warn('   LIVE mode needs WALLET_PRIVATE_KEY + RPC_URL. Skipping.');
           continue;
         }
@@ -974,7 +1020,7 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
   // REAL-TIME mode: watch new/imbalanced Meteora pools via logsSubscribe, evaluate misprice, execute.
   (async () => {
     const { watchNewPools } = await import('./watcher.js');
-    const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+    const RPC_URL = rpcEndpoints()[0] || 'https://api.mainnet-beta.solana.com';
     log(`\n👁️ WATCH MODE — real-time Meteora pool detection (execute on misprice > ${MIN_MISPRICING}%)`);
     watchNewPools({
       rpcUrl: RPC_URL,
