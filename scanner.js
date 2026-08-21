@@ -43,8 +43,8 @@ if (!DEBUG) {
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const OWNER = 'Gfast416';
 const REPO = 'cross-match-tool';
-const RETRY_LIMIT = 5;
-const RETRY_DELAY_MS = 1000;
+const RETRY_LIMIT = 2;
+const RETRY_DELAY_MS = 500;
 
 // --- Dynamic Data Sources ---
 // All endpoints are public, no auth needed, HTTPS only → minimal fees
