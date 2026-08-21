@@ -499,29 +499,48 @@ function normalizePool(rows, type, minTvl = 100) {
           const ys = r?.token_y?.address || r?.tokenY?.address || r?.token_b_mint || '';
           return xs === m || ys === m;
         };
-        // If the same mint appears in multiple pools (e.g. WSOL-MET and USDC-MET),
-        // keep the one we need for routing: DLMM prefers WSOL (SOL-side), DAMMv2 prefers USDC.
+        // FASE 1 (multi-pool): keep ALL pools per token (not just 1). Store as array so the
+        // path finder / buildRoute can compare multiple pools (different binStep/fee/quote).
         if (!poolMap.has(tokenMint)) {
-          poolMap.set(tokenMint, neu);
+          poolMap.set(tokenMint, [neu]);
         } else {
-          const ex = poolMap.get(tokenMint);
-          const exW = hasTok(ex.raw, WSOL_MINT);
-          const newW = hasTok(row, WSOL_MINT);
-          const exU = hasTok(ex.raw, USDC_MINT);
-          const newU = hasTok(row, USDC_MINT);
-          let replace = false;
-          if (type === 'dlmm') replace = (!exW && newW) || (exW === newW && tvlUsd > ex.tvlUsd);
-          else replace = (!exU && newU) || (exU === newU && tvlUsd > ex.tvlUsd);
-          if (replace) poolMap.set(tokenMint, neu);
+          poolMap.get(tokenMint).push(neu);
         }
+        // Index by pool address for direct lookup (used by graph / path finder).
+        const addr = row.address || row.poolAddress || row.lp_mint || '';
+        if (addr) POOLS_BY_ADDRESS.set(addr, neu);
       }
     } catch (err) {
       // Skip malformed entries
-      console.warn(`[normalizePool] skipping malformed ${type} pool:`, err.message);
+      if (DEBUG) console.warn(`[normalizePool] skipping malformed ${type} pool:`, err.message);
     }
   }
 
   return poolMap;
+}
+
+// Module-level index: pool address -> normalized pool (for graph/path lookups).
+const POOLS_BY_ADDRESS = new Map();
+export function getPoolByAddress(addr) { return POOLS_BY_ADDRESS.get(addr); }
+
+/**
+ * Pick the best pool from a token's pool array for a given routing need.
+ * preferMint = the token we want the pool to also contain (e.g. WSOL for SOL-side, USDC for close).
+ * Falls back to highest TVL if no preference matches.
+ */
+export function bestPool(pools, preferMint) {
+  if (!Array.isArray(pools) || pools.length === 0) return null;
+  if (pools.length === 1) return pools[0];
+  const hasTok = (p, m) => {
+    const xs = p.raw?.token_x?.address || p.raw?.tokenX?.address || p.raw?.token_a_mint || '';
+    const ys = p.raw?.token_y?.address || p.raw?.tokenY?.address || p.raw?.token_b_mint || '';
+    return xs === m || ys === m;
+  };
+  if (preferMint) {
+    const pref = pools.filter(p => hasTok(p, preferMint)).sort((a, b) => b.tvlUsd - a.tvlUsd);
+    if (pref.length) return pref[0];
+  }
+  return pools.slice().sort((a, b) => b.tvlUsd - a.tvlUsd)[0];
 }
 
 /**
@@ -640,8 +659,11 @@ async function findCrossDexMisprice(meteoraPools, jupiterPrices, raydiumPools, o
 
   for (const mint of allMints) {
     const prices = {};
-    const dlmm = meteoraPools.dlmm.get(mint);
-    const damm = meteoraPools.damm.get(mint);
+    // FASE 1: pick best pool per venue (WSOL/USDC preferred) from the multi-pool arrays.
+    const dlmmArr = meteoraPools.dlmm.get(mint);
+    const dammArr = meteoraPools.damm.get(mint);
+    const dlmm = dlmmArr ? bestPool(dlmmArr, WSOL_MINT) : undefined;
+    const damm = dammArr ? bestPool(dammArr, USDC_MINT) : undefined;
     // Meteora priceUsd is already USD (normalized by Meteora from the quote token).
     if (dlmm) prices.dlmm = Number(dlmm.priceUsd || 0);
     if (damm) prices.damm = Number(damm.priceUsd || 0);

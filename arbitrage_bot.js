@@ -37,7 +37,7 @@ import { config as dotenvConfig } from 'dotenv';
 try { dotenvConfig({ path: '.env.bot' }); } catch {}
 try { dotenvConfig({ path: '.env' }); } catch {}
 import BN from 'bn.js';
-import { normalizePool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
+import { normalizePool, bestPool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
 import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL } from './router.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
@@ -196,8 +196,11 @@ async function scanForCandidates() {
   // 1) Internal Meteora check: DLMM vs DAMMv2 for the same token.
   const commonTokens = [...dlmmPoolMap.keys()].filter(m => dammPoolMap.has(m));
   for (const mint of commonTokens) {
-    const dlmmPool = dlmmPoolMap.get(mint);
-    const dammPool = dammPoolMap.get(mint);
+    // FASE 1: pick the best DLMM (WSOL-side preferred) and best DAMMv2 (USDC-side preferred)
+    // out of ALL pools for this token — not just the first one.
+    const dlmmPool = bestPool(dlmmPoolMap.get(mint), WSOL_MINT);
+    const dammPool = bestPool(dammPoolMap.get(mint), USDC_MINT);
+    if (!dlmmPool || !dammPool) continue;
     const jupiterPrice = jupiterPrices[mint] || await fetchTokenPrice(mint);
     const c = findCandidates(dlmmPool, dammPool, jupiterPrice, MIN_MISPRICING);
     if (c) candidates.push({ ...c, dlmmPool, dammPool, source: 'meteora-internal' });
@@ -215,8 +218,8 @@ async function scanForCandidates() {
     for (const cd of crossDex) {
       // Only keep ones where Meteora is on the cheap side (buy on Meteora) OR
       // where Meteora DLMM vs DAMMv2 itself diverges (already covered above).
-      const dlmm = dlmmPoolMap.get(cd.tokenMint);
-      const damm = dammPoolMap.get(cd.tokenMint);
+      const dlmm = bestPool(dlmmPoolMap.get(cd.tokenMint), WSOL_MINT);
+      const damm = bestPool(dammPoolMap.get(cd.tokenMint), USDC_MINT);
       if (dlmm && damm) {
         // Meteora-internal already handled; skip to avoid duplicate.
         continue;
@@ -1070,7 +1073,7 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
         warn('TEST: MET pool missing from one venue — cannot test. dlmm?', dlmmPoolMap.has(MET), 'damm?', dammPoolMap.has(MET));
         process.exit(1);
       }
-      const cand = { baseMint: MET, direction: 'BUY_A_SELL_B', mispricingPct: 99, dlmmPool: dlmmPoolMap.get(MET), dammPool: dammPoolMap.get(MET) };
+      const cand = { baseMint: MET, direction: 'BUY_A_SELL_B', mispricingPct: 99, dlmmPool: bestPool(dlmmPoolMap.get(MET), WSOL_MINT), dammPool: bestPool(dammPoolMap.get(MET), USDC_MINT) };
       const route = buildRoute(cand, Math.floor(TRADE_AMOUNT_SOL * 1e9));
       if (!route) { warn('TEST: no valid WSOL route for MET'); process.exit(1); }
       log(`\n🧪 TEST MODE — forced ${route.leg1Venue}->${route.leg2Venue} (MET), ${TRADE_AMOUNT_SOL} SOL`);
@@ -1112,7 +1115,7 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
           if (!dlmmPoolMap.has(baseMint) || !dammPoolMap.has(baseMint)) {
             log(`   ⚪ counterpart pool missing for ${baseMint.slice(0,6)} — skip`); return;
           }
-          const cand = { baseMint, direction: 'BUY_A_SELL_B', mispricingPct: 99, dlmmPool: dlmmPoolMap.get(baseMint), dammPool: dammPoolMap.get(baseMint) };
+          const cand = { baseMint, direction: 'BUY_A_SELL_B', mispricingPct: 99, dlmmPool: bestPool(dlmmPoolMap.get(baseMint), WSOL_MINT), dammPool: bestPool(dammPoolMap.get(baseMint), USDC_MINT) };
           const route = buildRoute(cand, Math.floor(TRADE_AMOUNT_SOL * 1e9));
           if (!route) { log(`   ⚪ no WSOL route for ${baseMint.slice(0,6)} — skip`); return; }
           // dry-run estimate first
