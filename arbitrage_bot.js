@@ -235,6 +235,7 @@ async function scanForCandidates() {
         else if (hasTok(realRaw, WSOL_MINT)) quoteToken = WSOL_MINT;
         candidates.push({
           baseMint: cd.tokenMint,
+          tokenMint: cd.tokenMint,
           symbol: cd.symbol,
           direction: cd.meteoraIsCheap ? 'BUY_METEORA' : 'SELL_METEORA',
           mispricingPct: cd.spreadPct,
@@ -929,16 +930,24 @@ async function cycle() {
       // e.g. METEORA USDC-A misprice -> SOL->USDC->A->SOL via Jupiter (dexes restricted to the mispriced venue for hop2).
       if (c.crossDex && c.crossDex.quoteToken && c.crossDex.quoteToken !== WSOL_MINT) {
         const qt = c.crossDex.quoteToken === USDC_MINT ? ROUTER_USDC : ROUTER_USDT;
-        log(`\n   🎯 CROSS-DEX ${c.symbol} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qt.slice(0,6)} | cheap=${c.crossDex.cheapVenue}`);
+        const tk = c.baseMint || c.tokenMint;
+        const spread = c.crossDex.spreadPct || 0;
+        // Skip near-zero / noise spreads (e.g. 0.00%) — not a real arb.
+        if (spread < MIN_MISPRICING) {
+          log(`\n   🎯 CROSS-DEX ${c.symbol} | spread ${spread.toFixed(2)}% | quote=${qt.slice(0,6)} | cheap=${c.crossDex.cheapVenue}`);
+          log(`      ⚪ spread < ${MIN_MISPRICING}% — skip (noise)`);
+          continue;
+        }
+        log(`\n   🎯 CROSS-DEX ${c.symbol} | spread ${spread.toFixed(2)}% | quote=${qt.slice(0,6)} | cheap=${c.crossDex.cheapVenue}`);
         try {
           if (MODE === 'dry-run') {
-            log(`      ⚪ dry-run: would execute adaptive SOL->${qt.slice(0,6)}->${c.tokenMint.slice(0,6)}->SOL via Jupiter`);
+            log(`      ⚪ dry-run: would execute adaptive SOL->${qt.slice(0,6)}->${tk.slice(0,6)}->SOL via Jupiter`);
             continue;
           }
           if (!wallet) { warn('      ⚠️ wallet not initialized (check WALLET_PRIVATE_KEY) — skip live cross-dex'); continue; }
           initRouter(getConn(), wallet);
           const sigs = await executeAdaptiveRoute({
-            tokenMint: c.tokenMint,
+            tokenMint: tk,
             quoteToken: qt,
             mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined,
             startLamports
@@ -963,7 +972,12 @@ async function cycle() {
         // Skip only if there's truly no Meteora pool, or the quote token is WSOL (redundant loop).
         if (inMeteora && tk && c.crossDex && qtRaw && qtRaw !== WSOL_MINT) {
           const sym = c.symbol || tk.slice(0, 6);
-          log(`\n   🎯 CROSS-DEX ${sym} | spread ${c.crossDex.spreadPct.toFixed(2)}% | quote=${qtRaw.slice(0,6)} | (adaptive SOL->${qtRaw.slice(0,6)}->A->${qtRaw.slice(0,6)}->SOL)`);
+          const spr = c.crossDex.spreadPct || 0;
+          if (spr < MIN_MISPRICING) {
+            log(`\n   🎯 CROSS-DEX ${sym} | spread ${spr.toFixed(2)}% | quote=${qtRaw.slice(0,6)} | (adaptive)`);
+            log(`      ⚪ spread < ${MIN_MISPRICING}% — skip (noise)`);
+            continue;
+          }
           if (MODE === 'dry-run') {
             log(`      ⚪ dry-run: would execute adaptive route via Jupiter (DEX-agnostic)`);
             continue;
