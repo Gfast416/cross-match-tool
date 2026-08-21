@@ -311,6 +311,15 @@ function buildRoute(candidate, startAmountLamports) {
   const leg1IsDlmm = dlmmHasWsol;
   const leg2IsDlmm = dlmmHasUsdc;
 
+  // Need a real USDC-side pool to close the loop (token -> USDC). If neither venue has a
+  // USDC pool for this token, there is no internal DLMM->DAMMv2 route; return null so the
+  // cycle falls back to the Jupiter adaptive branch (SOL->A->SOL).
+  const leg2Real = (leg2IsDlmm ? candidate.dlmmPool.tvlUsd : candidate.dammPool.tvlUsd) > 0;
+  if (!leg2Real) {
+    log(`      ⚠️ no USDC-side pool for ${tokenMint.slice(0,6)} (only WSOL side) — internal route impossible; cross-dex branch will try Jupiter`);
+    return null;
+  }
+
   // No valid route if NEITHER venue has a WSOL pool for this token — SOL can't enter.
   // (e.g. USWS only has USDC pairs in both DLMM & DAMMv2). Skip this candidate.
   if (!dlmmHasWsol && !dammHasWsol) {
@@ -704,8 +713,10 @@ async function executeLive(route) {
     appendSwapIxs(allIxs, tx, 'DLMM swap (leg1)');
     var leg1OutAmount = quote.outAmount;
   } else {
+    const leg1Addr = route.leg1Pool?.raw?.address;
+    if (!leg1Addr) throw new Error(`leg1 pool has no on-chain address (stub pool) — cannot execute internal route`);
     const cpAmm = new CpAmm(getConn());
-    const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg1Pool.raw.address)), 20000, 'fetchPoolState leg1');
+    const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(leg1Addr)), 20000, 'fetchPoolState leg1');
     const dammQuote = await withTimeout(cpAmm.getQuote({
       inAmount: new BN(lamports),
       inputTokenMint: NATIVE_MINT,
@@ -744,7 +755,9 @@ async function executeLive(route) {
   const ataIx2 = await buildAtaIx(USDC_MINT);
   if (ataIx2) allIxs.push(ataIx2);
   if (route.leg2IsDlmm) {
-    const dlmmPool = await withTimeout(DLMM.create(getConn(), new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
+    const leg2Addr = route.leg2Pool?.raw?.address;
+    if (!leg2Addr) throw new Error(`leg2 pool has no on-chain address (stub pool) — cannot execute internal route`);
+    const dlmmPool = await withTimeout(DLMM.create(getConn(), new PublicKey(leg2Addr), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
     const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
     const quote = await withTimeout(dlmmPool.swapQuote(leg1OutAmount, swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
@@ -759,8 +772,10 @@ async function executeLive(route) {
     }), 25000, 'DLMM.swap leg2');
     appendSwapIxs(allIxs, tx2, 'DLMM swap (leg2)');
   } else {
+    const leg2Addr = route.leg2Pool?.raw?.address;
+    if (!leg2Addr) throw new Error(`leg2 pool has no on-chain address (stub pool) — cannot execute internal route`);
     const cpAmm = new CpAmm(getConn());
-    const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address)), 20000, 'fetchPoolState leg2');
+    const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(leg2Addr)), 20000, 'fetchPoolState leg2');
     const dammQuote2 = await withTimeout(cpAmm.getQuote({
       inAmount: leg1OutAmount,
       inputTokenMint: tokenMint,
