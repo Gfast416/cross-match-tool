@@ -396,9 +396,10 @@ async function addFeeOptimization(tx, estimateCu) {
 // IMPORTANT: if a stale/corrupt WSOL ATA exists under the WRONG token program
 // (e.g. Token-2022 from an earlier run), we must close+recreate it as SPL first,
 // otherwise every swap fails with "Account not associated with this Mint" / "IllegalOwner".
-async function prepareWsol(lamports) {
-  // Wrap slightly LESS than `lamports` so the wallet keeps enough native SOL to pay the
-  // wrap tx fee (otherwise the transfer empties the wallet and the tx fails -> WSOL ATA stays 0).
+// Build (but do NOT send) the WSOL wrap instructions: create ATA (if missing) + transfer SOL + syncNative.
+// In atomic mode these are concatenated into the single combined transaction.
+async function buildWrapIx(lamports) {
+  // Wrap slightly LESS than `lamports` so the wallet keeps native SOL for the tx fee.
   const wrapAmount = lamports - 5_000;
   const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
   const SPL = TOKEN_PROGRAM_ID;
@@ -408,100 +409,56 @@ async function prepareWsol(lamports) {
   } catch { info = null; }
 
   if (info && info.data) {
-    // ATA already exists.
     if (!info.owner.equals(SPL)) {
-      // Corrupt (wrong token program) — close it, then recreate+wrap below.
+      // Corrupt WSOL ATA (wrong program) — close then recreate. Return both instructions.
       const closeIx = createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], info.owner);
-      const closeTx = new Transaction().add(closeIx);
-      closeTx.feePayer = wallet.publicKey;
-      const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash close-wsol');
-      closeTx.recentBlockhash = blockhash;
-      await sendAndConfirm(await addFeeOptimization(closeTx, 120_000), 'close stale WSOL ATA');
-      // fall through to create+wrap
-    } else {
-      // Healthy SPL ATA already present — just wrap (do NOT recreate, avoids "already in use").
-      const wrapTx = new Transaction().add(
+      return [
+        closeIx,
+        createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, SPL),
         SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports: wrapAmount }),
         createSyncNativeInstruction(ata, SPL)
-      );
-      wrapTx.feePayer = wallet.publicKey;
-      const { blockhash: bh } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash');
-      wrapTx.recentBlockhash = bh;
-      await sendAndConfirm(await addFeeOptimization(wrapTx, 200_000), 'wrap SOL->WSOL');
-      return;
+      ];
     }
+    // Healthy ATA present — just wrap.
+    return [
+      SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports: wrapAmount }),
+      createSyncNativeInstruction(ata, SPL)
+    ];
   }
-  // Create ATA (fresh or after close) + wrap in one tx.
-  const ixs = [
+  // Fresh ATA + wrap.
+  return [
     createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, NATIVE_MINT, SPL),
     SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: ata, lamports: wrapAmount }),
     createSyncNativeInstruction(ata, SPL)
   ];
-  const tx = new Transaction().add(...ixs);
-  tx.feePayer = wallet.publicKey;
-  const { blockhash: bh2 } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash');
-  tx.recentBlockhash = bh2;
-  const optimized = await addFeeOptimization(tx, 200_000);
-  return await sendAndConfirm(optimized, 'wrap SOL->WSOL');
 }
 
-// Close the WSOL ATA and recover its lamports back to SOL (only if it exists & balance ~0).
-async function closeWsol() {
+// Build (do NOT send) the WSOL close instruction (recover leftover lamports) — only if ATA exists & empty.
+async function buildCloseWsolIx() {
   try {
     const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
     let info;
     try {
       info = await withTimeout(connection.getAccountInfo(ata), RPC_TIMEOUT_MS, 'getAccountInfo WSOL ATA close');
-    } catch {
-      return null; // WSOL ATA doesn't exist — nothing to close
-    }
+    } catch { return null; }
     if (!info || !info.data) return null;
-    const balRaw = info.data && info.value ? info.value.lamports : 0; // not used; balance checked below
-    // balance check via token account
     let bal = 0n;
     try {
       const tb = await withTimeout(connection.getTokenAccountBalance(ata), RPC_TIMEOUT_MS, 'getTokenAccountBalance');
       bal = BigInt(tb.value.amount);
     } catch { bal = 0n; }
-    if (bal > 0n) {
-      log('      ℹ️ WSOL balance > 0, skipping close (funds in use)');
-      return null;
-    }
-    const ix = createCloseAccountInstruction(
-      ata, wallet.publicKey, wallet.publicKey, [], info.owner // close with the ATA's actual owner program
-    );
-    let tx = new Transaction().add(ix);
-    tx.feePayer = wallet.publicKey;
-    const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash close');
-    tx.recentBlockhash = blockhash;
-    tx = await addFeeOptimization(tx, 150_000);
-    return await sendAndConfirm(tx, 'close WSOL');
-  } catch (e) {
-    warn('closeWsol failed (non-fatal):', e.message);
-    return null;
-  }
+    if (bal > 0n) { dbg('WSOL balance > 0, skip close'); return null; }
+    return createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], info.owner);
+  } catch { return null; }
 }
 
-// Create the output token's ATA in its OWN tx (separate from the swap) if missing.
-// The Meteora SDK's getOrCreateATAInstruction only does CreateIdempotent — for some
-// mints the ATA is created but NOT initialized, so the subsequent swap fails with
-// "Account not associated with this Mint". Pre-creating it here (own sendAndConfirm,
-// never prepended to the swap tx) guarantees an initialized ATA before the swap.
-async function ensureAtaSeparate(mint) {
+// Build (do NOT send) an ATA-creation instruction for `mint` if the ATA is missing/uninitialized.
+async function buildAtaIx(mint) {
   const ata = await getAssociatedTokenAddress(new PublicKey(mint), wallet.publicKey);
   const info = await withTimeout(connection.getAccountInfo(ata), 20000, 'getAccountInfo ATA');
-  if (info && info.data) return ata; // already exists & initialized
+  if (info && info.data) return null; // already exists
   const prog = await getMintProgram(mint);
-  const ix = createAssociatedTokenAccountInstruction(
-    wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), prog
-  );
-  let tx = new Transaction().add(ix);
-  tx.feePayer = wallet.publicKey;
-  const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash ata');
-  tx.recentBlockhash = blockhash;
-  tx = await addFeeOptimization(tx, 120_000);
-  await sendAndConfirm(tx, `create ATA ${new PublicKey(mint).toBase58().slice(0, 6)}`);
-  return ata;
+  return createAssociatedTokenAccountInstruction(wallet.publicKey, ata, wallet.publicKey, new PublicKey(mint), prog);
 }
 
 async function sendAndConfirm(tx, label) {
@@ -542,10 +499,19 @@ async function getMintProgram(mint) {
   return TOKEN_PROGRAM_ID;
 }
 
+// Extract a swap SDK's Transaction instructions into `out`, dropping any ComputeBudget
+// instructions (we set a single CU limit/price on the combined atomic tx instead).
+function appendSwapIxs(out, swapTx, label) {
+  for (const ix of swapTx.instructions || []) {
+    if (ix.programId && ix.programId.equals(ComputeBudgetProgram.programId)) continue;
+    out.push(ix);
+  }
+}
+
 async function executeLive(route) {
   await initLive();
-  const tokenMint = new PublicKey(route.tokenMint);
   const lamports = route.startAmountLamports;
+  const allIxs = []; // collect ALL instructions -> one atomic transaction
 
   // Guard: wrapping needs native SOL = wrapAmount + tx fees, so require a buffer over the trade size.
   try {
@@ -558,28 +524,21 @@ async function executeLive(route) {
     dbg(`wallet SOL=${bal/1e9} needed>=${needed/1e9}`);
   } catch { /* non-fatal */ }
 
-  // Pre-create the leg-1 OUTPUT token ATA (separate tx) so the swap's own
-  // getOrCreateATAInstruction finds an already-initialized account.
-  await ensureAtaSeparate(tokenMint);
-
-  // DEBUG: report WSOL ATA balance right before the swap so a failure is diagnosable.
-  try {
-    const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
-    const wb = await withTimeout(connection.getTokenAccountBalance(wsolAta), RPC_TIMEOUT_MS, 'wsol bal');
-    dbg(`wsol ATA balance=${(wb?.value?.amount || '0')} need>=${lamports - 100_000}`);
-  } catch { /* non-fatal */ }
+  // Pre-build the leg-1 OUTPUT token ATA creation (if missing) — appended to the combined tx.
+  const ataIx1 = await buildAtaIx(tokenMint);
+  if (ataIx1) allIxs.push(ataIx1);
 
   let sigs = [];
   // ---------- Leg 1: SOL (WSOL) -> token (on the pool that contains WSOL) ----------
   if (route.leg1IsDlmm) {
-    // DLMM does NOT wrap SOL itself — wrap WSOL manually in a separate tx first.
-    await prepareWsol(lamports);
+    // DLMM does NOT wrap SOL itself — build the wrap instructions here.
+    allIxs.push(...await buildWrapIx(lamports));
     const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg1Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg1');
     const swapForY = dlmmSwapForY(dlmmPool, WSOL_MINT); // input = WSOL
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg1');
     const inLamports = lamports - 105_000; // wrapAmount(5k buffer) minus DLMM fee room
     const quote = await withTimeout(dlmmPool.swapQuote(new BN(inLamports), swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg1');
-    let tx = await withTimeout(dlmmPool.swap({
+    const tx = await withTimeout(dlmmPool.swap({
       inToken: swapForY ? dlmmPool.tokenX.publicKey : dlmmPool.tokenY.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
       inAmount: new BN(inLamports),
@@ -588,9 +547,7 @@ async function executeLive(route) {
       minOutAmount: quote.minOutAmount,
       outToken: swapForY ? dlmmPool.tokenY.publicKey : dlmmPool.tokenX.publicKey
     }), 25000, 'DLMM.swap leg1');
-    tx = await addFeeOptimization(tx, 600_000);
-    const sig1 = await sendAndConfirm(tx, 'DLMM swap (leg1)');
-    sigs.push(sig1);
+    appendSwapIxs(allIxs, tx, 'DLMM swap (leg1)');
     var leg1OutAmount = quote.outAmount;
   } else {
     const cpAmm = new CpAmm(connection);
@@ -606,11 +563,10 @@ async function executeLive(route) {
       tokenBDecimal: 9,
     }), 20000, 'getQuote leg1');
     const minOut1 = dammQuote?.minSwapOutAmount || new BN(0);
-    // Resolve token program: prefer on-chain poolState.tokenAProgram, else read mint owner (SPL vs Token-2022).
     const taProg = poolState.tokenAProgram || await getMintProgram(poolState.tokenAMint);
     const tbProg = poolState.tokenBProgram || await getMintProgram(poolState.tokenBMint);
     dbg(`leg1 tokenAMint=${poolState.tokenAMint} tokenAFlag=${poolState.tokenAFlag} onChainProg=${poolState.tokenAProgram && poolState.tokenAProgram} ownerA=${taProg.toBase58()}`);
-    let tx = await withTimeout(cpAmm.swap({
+    const tx = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg1Pool.raw.address),
       inputTokenMint: NATIVE_MINT,
@@ -626,21 +582,19 @@ async function executeLive(route) {
       referralTokenAccount: null,
       poolState
     }), 25000, 'CpAmm.swap leg1');
-    tx = await addFeeOptimization(tx, 400_000);
-    const sig1 = await sendAndConfirm(tx, 'DAMMv2 swap (leg1)');
-    sigs.push(sig1);
+    appendSwapIxs(allIxs, tx, 'DAMMv2 swap (leg1)');
     var leg1OutAmount = dammQuote?.swapOutAmount || new BN(0);
   }
 
   // ---------- Leg 2: token -> USDC (on the pool that contains USDC) ----------
-  // Pre-create the USDC output ATA (separate tx) so the swap finds it initialized.
-  await ensureAtaSeparate(USDC_MINT);
+  const ataIx2 = await buildAtaIx(USDC_MINT);
+  if (ataIx2) allIxs.push(ataIx2);
   if (route.leg2IsDlmm) {
     const dlmmPool = await withTimeout(DLMM.create(connection, new PublicKey(route.leg2Pool.raw.address), { cluster: 'mainnet-beta' }), 20000, 'DLMM.create leg2');
     const swapForY = dlmmSwapForY(dlmmPool, tokenMint); // input = token
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
     const quote = await withTimeout(dlmmPool.swapQuote(leg1OutAmount, swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
-    let tx2 = await withTimeout(dlmmPool.swap({
+    const tx2 = await withTimeout(dlmmPool.swap({
       inToken: dlmmPool.tokenX.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
       inAmount: quote.outAmount,
@@ -649,9 +603,7 @@ async function executeLive(route) {
       minOutAmount: quote.minOutAmount,
       outToken: dlmmPool.tokenY.publicKey
     }), 25000, 'DLMM.swap leg2');
-    tx2 = await addFeeOptimization(tx2, 600_000);
-    const sig2 = await sendAndConfirm(tx2, 'DLMM swap (leg2)');
-    sigs.push(sig2);
+    appendSwapIxs(allIxs, tx2, 'DLMM swap (leg2)');
   } else {
     const cpAmm = new CpAmm(connection);
     const poolState = await withTimeout(cpAmm.fetchPoolState(new PublicKey(route.leg2Pool.raw.address)), 20000, 'fetchPoolState leg2');
@@ -669,7 +621,7 @@ async function executeLive(route) {
     const taProg2 = poolState.tokenAProgram || await getMintProgram(poolState.tokenAMint);
     const tbProg2 = poolState.tokenBProgram || await getMintProgram(poolState.tokenBMint);
     log(`      [debug leg2] tokenAMint=${poolState.tokenAMint} tokenAFlag=${poolState.tokenAFlag} onChainProg=${poolState.tokenAProgram && poolState.tokenAProgram} ownerA=${taProg2.toBase58()}`);
-    let tx2 = await withTimeout(cpAmm.swap({
+    const tx2 = await withTimeout(cpAmm.swap({
       payer: wallet.publicKey,
       pool: new PublicKey(route.leg2Pool.raw.address),
       inputTokenMint: tokenMint,
@@ -685,14 +637,24 @@ async function executeLive(route) {
       referralTokenAccount: null,
       poolState
     }), 25000, 'CpAmm.swap leg2');
-    tx2 = await addFeeOptimization(tx2, 400_000);
-    const sig2 = await sendAndConfirm(tx2, 'DAMMv2 swap (leg2)');
-    sigs.push(sig2);
+    appendSwapIxs(allIxs, tx2, 'DAMMv2 swap (leg2)');
   }
 
-  // Recover any leftover WSOL back to SOL (non-fatal).
-  const sig3 = await closeWsol();
-  if (sig3) sigs.push(sig3);
+  // Recover any leftover WSOL back to SOL (if ATA empty).
+  const closeIx = await buildCloseWsolIx();
+  if (closeIx) allIxs.push(closeIx);
+
+  // ---- Build ONE atomic transaction from all collected instructions ----
+  const bigTx = new Transaction();
+  bigTx.add(...allIxs);
+  bigTx.feePayer = wallet.publicKey;
+  const { blockhash } = await withTimeout(connection.getLatestBlockhash('confirmed'), RPC_TIMEOUT_MS, 'getLatestBlockhash atomic');
+  bigTx.recentBlockhash = blockhash;
+  // High CU limit for the combined tx (wrap + 2 swaps + ATAs + close).
+  bigTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
+  bigTx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+  const sig = await sendAndConfirm(bigTx, 'ATOMIC swap (leg1+leg2)');
+  sigs.push(sig);
   return { sent: true, venue: `${route.leg1Venue}→${route.leg2Venue}`, sigs };
 }
 
