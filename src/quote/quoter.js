@@ -40,14 +40,17 @@ export async function jupiterQuote(inputMint, outputMint, amount, {
 export async function fetchJupiterPrices(mints) {
   const prices = {};
   if (!mints.length) return prices;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const res = await fetch(`${JUP_PRICE}?ids=${mints.join(',')}`);
+    const res = await fetch(`${JUP_PRICE}?ids=${mints.join(',')}`, { signal: ctrl.signal });
     if (res.ok) {
       const data = await res.json();
       const d = data?.data || {};
       for (const m of mints) if (d[m]?.price) prices[m] = Number(d[m].price);
     }
   } catch { /* non-fatal */ }
+  finally { clearTimeout(t); }
   return prices;
 }
 

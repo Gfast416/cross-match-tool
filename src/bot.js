@@ -16,16 +16,14 @@ import {
 const store = new PoolStore();
 
 async function enrichUsdPrices() {
-  // Jupiter price for every mint we track (cap to avoid giant URL).
   const mints = [...store.byMint.keys()];
   const prices = await fetchJupiterPrices(mints.slice(0, 400));
-  // Write priceUsdA into each pool for the finder.
+  let enriched = 0;
   for (const p of store.getAll()) {
-    const usd = prices[p.mintA] || prices[p.mintB] || 0;
-    if (p.mintA && prices[p.mintA]) p.priceUsdA = prices[p.mintA];
-    if (p.mintB && prices[p.mintB]) p.priceUsdB = prices[p.mintB];
-    void usd;
+    if (p.mintA && prices[p.mintA]) { p.priceUsdA = prices[p.mintA]; enriched++; }
+    if (p.mintB && prices[p.mintB]) { p.priceUsdB = prices[p.mintB]; }
   }
+  dbg(`enriched ${enriched}/${store.getAll().length} pools with Jupiter USD`);
   return prices;
 }
 
