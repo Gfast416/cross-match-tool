@@ -64,8 +64,8 @@ async function withTimeout(promise, ms = RPC_TIMEOUT_MS, label = 'rpc') {
 
 const DLMM_API = 'https://dlmm.datapi.meteora.ag/pools';
 const DAMM_API = 'https://damm-v2.datapi.meteora.ag/pools';
-const JUPITER_PRICE_API = 'https://api.jup.ag/price/v3';
-const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/quote';
+const JUPITER_PRICE_API = 'https://price.jup.ag/v4/price';
+const JUPITER_QUOTE_API = 'https://api.jup.ag/swap/v1/quote';
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -115,7 +115,7 @@ async function fetchTokenPrice(mint) {
     const resp = await fetch(`${JUPITER_PRICE_API}?ids=${mint}`, { signal: ctrl.signal });
     clearTimeout(t);
     const data = await resp.json();
-    const price = parseFloat(data?.[mint]?.usdPrice) || 0;
+    const price = parseFloat(data?.data?.[mint]?.price) || 0;
     priceCache.set(mint, { price, ts: Date.now() });
     return price;
   } catch { return 0; }
@@ -482,7 +482,9 @@ async function buildWrapIx(lamports) {
   ];
 }
 
-// Build (do NOT send) the WSOL close instruction (recover leftover lamports) — only if ATA exists & empty.
+// Build (do NOT send) the WSOL close instruction (recover leftover lamports) — only if ATA exists.
+// If a small WSOL balance remains (e.g. DLMM swap left a fee buffer), sync it back to native SOL
+// before closing so the lamports aren't lost.
 async function buildCloseWsolIx() {
   try {
     const ata = await getAssociatedTokenAddress(NATIVE_MINT, wallet.publicKey);
@@ -496,8 +498,14 @@ async function buildCloseWsolIx() {
       const tb = await withTimeout(connection.getTokenAccountBalance(ata), RPC_TIMEOUT_MS, 'getTokenAccountBalance');
       bal = BigInt(tb.value.amount);
     } catch { bal = 0n; }
-    if (bal > 0n) { dbg('WSOL balance > 0, skip close'); return null; }
-    return createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], info.owner);
+    dbg(`WSOL ATA close: bal=${bal} owner=${info.owner.toBase58()}`);
+    const ixs = [];
+    if (bal > 0n) {
+      // Sync remaining WSOL -> native SOL before closing so it isn't burned.
+      ixs.push(createSyncNativeInstruction(ata, info.owner));
+    }
+    ixs.push(createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey, [], info.owner));
+    return ixs;
   } catch { return null; }
 }
 
@@ -645,13 +653,13 @@ async function executeLive(route) {
     const binArrays = await withTimeout(dlmmPool.getBinArrayForSwap(swapForY), 20000, 'getBinArrayForSwap leg2');
     const quote = await withTimeout(dlmmPool.swapQuote(leg1OutAmount, swapForY, dlmmSlippageBps(), binArrays), 20000, 'swapQuote leg2');
     const tx2 = await withTimeout(dlmmPool.swap({
-      inToken: dlmmPool.tokenX.publicKey,
+      inToken: swapForY ? dlmmPool.tokenX.publicKey : dlmmPool.tokenY.publicKey,
       binArraysPubkey: quote.binArraysPubkey,
       inAmount: quote.outAmount,
       lbPair: dlmmPool.pubkey,
       user: wallet.publicKey,
       minOutAmount: quote.minOutAmount,
-      outToken: dlmmPool.tokenY.publicKey
+      outToken: swapForY ? dlmmPool.tokenY.publicKey : dlmmPool.tokenX.publicKey
     }), 25000, 'DLMM.swap leg2');
     appendSwapIxs(allIxs, tx2, 'DLMM swap (leg2)');
   } else {
@@ -692,7 +700,7 @@ async function executeLive(route) {
 
   // Recover any leftover WSOL back to SOL (if ATA empty).
   const closeIx = await buildCloseWsolIx();
-  if (closeIx) allIxs.push(closeIx);
+  if (closeIx) allIxs.push(...closeIx);
 
   // ---- Build ONE atomic transaction from all collected instructions ----
   const bigTx = new Transaction();
