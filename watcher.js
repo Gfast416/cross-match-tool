@@ -24,17 +24,22 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
   catch (e) { return; }
   if (!tx) return;
   const m = tx.transaction.message;
-  const acctKeys = (m.accountKeys || m.staticAccountKeys || []).map(k => k.toBase58());
-  const ixs = m.instructions || m.compiledInstructions || [];
+  // Correct account-key resolution for both legacy + v0 versioned txs.
+  const accountKeys = (typeof m.getAccountKeys === 'function')
+    ? m.getAccountKeys().staticAccountKeys.map(k => k.toBase58())
+    : (m.accountKeys || m.staticAccountKeys || []).map(k => k.toBase58());
+  const ixs = m.compiledInstructions || m.instructions || [];
   const progIndices = [DLMM_PROGRAM, DAMMV2_PROGRAM];
   let poolAddr = null, isDlmm = false;
   for (const ix of ixs) {
-    const pid = acctKeys[ix.programIdIndex];
-    if (progIndices.includes(pid)) {
-      poolAddr = acctKeys[ix.accounts[0]];
-      isDlmm = pid === DLMM_PROGRAM;
-      break;
-    }
+    // versioned: ix.programIdIndex + ix.accountKeyIndexes[]; legacy: ix.programIdIndex + ix.accounts[]
+    const pid = accountKeys[ix.programIdIndex];
+    if (!pid || !progIndices.includes(pid)) continue;
+    const firstAcct = ix.accountKeyIndexes ? ix.accountKeyIndexes[0] : ix.accounts?.[0];
+    if (firstAcct === undefined) continue;
+    poolAddr = accountKeys[firstAcct];
+    isDlmm = pid === DLMM_PROGRAM;
+    break;
   }
   if (!poolAddr) return;
   if (seen.has('pool:' + poolAddr)) return;
@@ -61,7 +66,7 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
     }
     await onCandidate({ ...info, signature: sig, logs });
   } catch (e) {
-    if (process.env.WATCH_DEBUG) log('⚠️ handleTx pool read failed:', e.message);
+    if (process.env.WATCH_DEBUG) console.warn('⚠️ handleTx pool read failed:', e.message);
     // pool may not be fully initialized yet — ignore
   }
 }
