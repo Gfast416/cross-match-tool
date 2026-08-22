@@ -34,6 +34,47 @@ async function withRetry(fn, tries = 3, delayMs = 1000) {
   throw lastErr;
 }
 
+// Try each DEX decoder for a pool address; pools are sometimes mislabeled by the
+// instruction account index, so fall back across DLMM / DAMMv2 / Raydium.
+async function decodePoolAny(pickConn, poolAddr) {
+  const pk = new PublicKey(poolAddr);
+  // Raydium V4 (fixed layout)
+  try {
+    const conn = pickConn();
+    const acc = await withRetry(() => conn.getAccountInfo(pk, { commitment: 'confirmed' }));
+    if (acc && acc.data && acc.data.length > 300) {
+      const buf = acc.data;
+      const mintA = new PublicKey(buf.slice(0, 32)).toBase58();
+      const mintB = new PublicKey(buf.slice(32, 64)).toBase58();
+      const baseReserve = buf.readBigUInt64LE(256);
+      const quoteReserve = buf.readBigUInt64LE(264);
+      if (baseReserve > 0n && quoteReserve > 0n)
+        return { poolAddress: poolAddr, venue: 'RAYDIUM', tokenX: mintA, tokenY: mintB, reserveX: baseReserve, reserveY: quoteReserve };
+    }
+  } catch {}
+  // DLMM
+  try {
+    const conn = pickConn();
+    const pool = await withRetry(() => DLMM.create(conn, pk, { cluster: 'mainnet-beta' }));
+    return {
+      poolAddress: poolAddr, venue: 'DLMM',
+      tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
+      reserveX: pool.lbPair.reserveX, reserveY: pool.lbPair.reserveY, binStep: pool.lbPair.binStep
+    };
+  } catch {}
+  // DAMMv2
+  try {
+    const conn = pickConn();
+    const cp = new CpAmm(conn);
+    const ps = await withRetry(() => cp.fetchPoolState(pk));
+    return {
+      poolAddress: poolAddr, venue: 'DAMMv2',
+      tokenX: ps.tokenAMint?.toBase58?.() || ps.tokenA?.address, tokenY: ps.tokenBMint?.toBase58?.() || ps.tokenB?.address,
+      reserveX: ps.tokenAAmount, reserveY: ps.tokenBAmount
+    };
+  } catch (e) { throw e; }
+}
+
 // Only fetch txs that actually CREATE a pool (not swaps/fees) — cuts request volume ~20x.
 const isNewPool = (logs) => logs.some(l => /InitializeLbPair|InitializePool|Initialize\b/i.test(l));
 
@@ -71,39 +112,10 @@ async function handleTx(pickConn, sig, logs, onCandidate, seen) {
   seen.add('pool:' + poolAddr);
 
   try {
-    let info;
-    if (isRaydium) {
-      const conn = pickConn();
-      const acc = await withRetry(() => conn.getAccountInfo(new PublicKey(poolAddr), { commitment: 'confirmed' }));
-      if (!acc || !acc.data) return;
-      const buf = acc.data;
-      const mintA = new PublicKey(buf.slice(0, 32)).toBase58();
-      const mintB = new PublicKey(buf.slice(32, 64)).toBase58();
-      const baseReserve = buf.readBigUInt64LE(256);
-      const quoteReserve = buf.readBigUInt64LE(264);
-      info = { poolAddress: poolAddr, venue: 'RAYDIUM', tokenX: mintA, tokenY: mintB, reserveX: baseReserve, reserveY: quoteReserve };
-    } else if (isDlmm) {
-      const conn = pickConn();
-      const pool = await withRetry(() => DLMM.create(conn, new PublicKey(poolAddr), { cluster: 'mainnet-beta' }));
-      info = {
-        poolAddress: poolAddr, venue: 'DLMM',
-        tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
-        reserveX: pool.lbPair.reserveX, reserveY: pool.lbPair.reserveY,
-        binStep: pool.lbPair.binStep
-      };
-    } else {
-      const conn = pickConn();
-      const cp = new CpAmm(conn);
-      const ps = await withRetry(() => cp.fetchPoolState(new PublicKey(poolAddr)));
-      info = {
-        poolAddress: poolAddr, venue: 'DAMMv2',
-        tokenX: ps.tokenAMint?.toBase58?.() || ps.tokenA?.address, tokenY: ps.tokenBMint?.toBase58?.() || ps.tokenB?.address,
-        reserveX: ps.tokenAAmount, reserveY: ps.tokenBAmount
-      };
-    }
+    const info = await decodePoolAny(pickConn, poolAddr);
     await onCandidate({ ...info, signature: sig, logs });
   } catch (e) {
-    if (process.env.WATCH_DEBUG) console.warn('⚠️ handleTx pool read failed:', e.message);
+    if (process.env.WATCH_DEBUG) console.warn(`⚠️ handleTx pool read failed [${isDlmm ? 'DLMM' : isRaydium ? 'RAYDIUM' : 'DAMMv2'}] ${poolAddr?.slice(0,8)}:`, e.message);
   }
 }
 
