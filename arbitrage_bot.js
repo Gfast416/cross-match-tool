@@ -1187,6 +1187,8 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
   // REAL-TIME mode: watch new/imbalanced Meteora pools via logsSubscribe, evaluate misprice, execute.
   (async () => {
     const { watchNewPools } = await import('./watcher.js');
+    const { mintUsdFromPool } = await import('./onchain.js');
+    const { jupQuote } = await import('./router.js');
     const RPC_URL = rpcEndpoints()[0] || 'https://api.mainnet-beta.solana.com';
     log(`\n👁️ WATCH MODE — real-time Meteora pool detection (execute on misprice > ${MIN_MISPRICING}%)`);
     watchNewPools({
@@ -1194,36 +1196,50 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
       minMispricePct: MIN_MISPRICING,
       onCandidate: async (info) => {
         try {
-          // Only act on pools that contain WSOL (so we can route SOL in) or USDC (route out).
+          const RPC = rpcEndpoints()[0];
+          const conn = new (await import('@solana/web3.js')).Connection(RPC, 'confirmed');
+          // info: { poolAddress, venue, tokenX, tokenY, reserveX, reserveY } (reserves already on-chain from watcher)
           const hasWsol = info.tokenX === WSOL_MINT || info.tokenY === WSOL_MINT;
           const hasUsdc = info.tokenX === USDC_MINT || info.tokenY === USDC_MINT;
-          const baseMint = info.tokenX === WSOL_MINT || info.tokenX === USDC_MINT ? info.tokenY
-                         : info.tokenY === WSOL_MINT || info.tokenY === USDC_MINT ? info.tokenX : null;
-          if (!baseMint) { dbg(`pool ${info.poolAddress.slice(0,8)} no WSOL/USDC — skip`); return; }
-          log(`\n🆕 POOL ${info.venue} ${info.poolAddress.slice(0,10)} token=${baseMint.slice(0,6)} wsol=${hasWsol} usdc=${hasUsdc}`);
-          // Fetch the counterpart pool (dlmm<->damm) for the same token to build a 2-hop route.
-          const [dlmmRows, dammRows] = await Promise.all([
-            fetchAllPages('DLMM', DLMM_API, MAX_PAGES),
-            fetchAllPages('DAMM', DAMM_API, MAX_PAGES)
-          ]);
-          const dlmmPoolMap = normalizePool(dlmmRows, 'dlmm', MIN_TVL);
-          const dammPoolMap = normalizePool(dammRows, 'damm', MIN_TVL);
-          if (!dlmmPoolMap.has(baseMint) || !dammPoolMap.has(baseMint)) {
-            log(`   ⚪ counterpart pool missing for ${baseMint.slice(0,6)} — skip`); return;
-          }
-          const cand = { baseMint, direction: 'BUY_A_SELL_B', mispricingPct: 99, dlmmPool: bestPool(dlmmPoolMap.get(baseMint), WSOL_MINT), dammPool: bestPool(dammPoolMap.get(baseMint), USDC_MINT) };
-          const route = buildRoute(cand, Math.floor(TRADE_AMOUNT_SOL * 1e9));
-          if (!route) { log(`   ⚪ no WSOL route for ${baseMint.slice(0,6)} — skip`); return; }
-          // dry-run estimate first
-          const sim = await dryRun(route);
-          if (!sim) { log(`   ⚪ dry-run failed — skip`); return; }
-          log(`   💡 est net ${sim.netPct.toFixed(2)}% (${route.leg1Venue}->${route.leg2Venue})`);
-          if (sim.netPct >= MIN_PROFIT_PCT && MODE === 'live') {
-            const res = await executeLive(route);
-            log(`   ✅ WATCH executed (${res.venue}): ${res.sigs.join(' , ')}`);
-            for (const s of res.sigs) log(`   https://solscan.io/tx/${s}`);
+          const anchorMint = hasWsol ? WSOL_MINT : hasUsdc ? USDC_MINT : null;
+          if (!anchorMint) { dbg(`pool ${info.poolAddress.slice(0,8)} no WSOL/USDC anchor — skip`); return; }
+          const baseMint = info.tokenX === anchorMint ? info.tokenY : info.tokenX;
+          log(`\n🆕 POOL ${info.venue} ${info.poolAddress.slice(0,10)} base=${baseMint.slice(0,6)} anchor=${anchorMint.slice(0,4)}`);
+
+          // 1) On-chain price of base token (reverse from reserves).
+          const onchain = { tokenX: info.tokenX, tokenY: info.tokenY, reserveX: info.reserveX, reserveY: info.reserveY, priceXinY: (Number(info.reserveY)/Math.pow(10,9)) / (Number(info.reserveX)/Math.pow(10,9)) };
+          // 2) USD anchor: quote SOL->USDC and SOL->base via Jupiter (executable prices).
+          const startLamports = Math.floor(TRADE_AMOUNT_SOL * 1e9);
+          const qUsdc = await jupQuote(WSOL_MINT, USDC_MINT, startLamports, {}).catch(() => null);
+          const qBase = await jupQuote(WSOL_MINT, baseMint, startLamports, {}).catch(() => null);
+          if (!qUsdc || !qBase) { log(`   ⚪ jupiter quote unavailable — skip`); return; }
+          const usdcPerSol = Number(qUsdc.outAmount) / 1e6;        // USDC has 6 decimals
+          const basePerSol = Number(qBase.outAmount) / 1e9;        // base assumed 9 decimals
+          const anchorUsd = usdcPerSol;                             // 1 SOL = usdcPerSol USD
+          const baseUsdJup = (1 / basePerSol) * anchorUsd;          // Jupiter USD price of base
+
+          // 3) On-chain USD price of base (reverse): anchor price * (base per anchor from reserves).
+          //    priceXinY = anchor per base (if anchor is X) or base per anchor (if anchor is Y).
+          let baseUsdOnchain;
+          if (info.tokenX === anchorMint) baseUsdOnchain = anchorUsd / onchain.priceXinY; // anchor=base of priceXinY
+          else baseUsdOnchain = anchorUsd * onchain.priceXinY;       // anchor=quote of priceXinY
+
+          if (!baseUsdOnchain || !baseUsdJup) { log(`   ⚪ price compute failed — skip`); return; }
+          const spreadPct = ((baseUsdJup - baseUsdOnchain) / baseUsdOnchain) * 100;
+          log(`   💡 onchain $${baseUsdOnchain.toFixed(6)} vs jupiter $${baseUsdJup.toFixed(6)} -> spread ${spreadPct.toFixed(2)}%`);
+
+          // 4) If mispriced beyond threshold, execute a 3-hop route via Jito bundle atomically.
+          if (Math.abs(spreadPct) >= MIN_MISPRICING && MODE === 'live') {
+            const route = [WSOL_MINT, anchorMint, baseMint, anchorMint, WSOL_MINT];
+            try {
+              const jr = await executeRouteViaJito(route, startLamports, { tipLamports: Number(process.env.JITO_TIP_LAMPORTS || 2000) });
+              log(`   🚀 WATCH executed (Jito bundle): ${jr.bundleId}`);
+              log(`   https://explorer.jito.wtf/bundle/${jr.bundleId}`);
+            } catch (je) {
+              warn(`   ⚠️ Jito failed (${je.message}) — skip`);
+            }
           } else {
-            log(`   ⚪ below min profit (${MIN_PROFIT_PCT}%) — watch only`);
+            log(`   ⚪ spread < min (${MIN_MISPRICING}%) — watch only`);
           }
         } catch (e) { fail('watch candidate', e); }
       }
