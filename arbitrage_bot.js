@@ -1261,9 +1261,9 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
           const spreadPct = ((baseUsdJup - baseUsdOnchain) / baseUsdOnchain) * 100;
           log(`   >>> 💡 onchain $${baseUsdOnchain.toFixed(6)} vs jupiter $${baseUsdJup.toFixed(6)} -> spread ${spreadPct.toFixed(2)}%`);
 
-          // 4) If mispriced beyond threshold, execute atomically via Jito bundle.
-          //    Buy the base token CHEAP in the newly-detected on-chain pool, sell it on Jupiter.
-          if (Math.abs(spreadPct) >= MIN_MISPRICING && MODE === 'live') {
+          // 4) If mispriced beyond threshold AND not absurdly large (absurd = stale price, would rug), execute.
+          const MAX_SPREAD = parseFloat(process.env.MAX_SPREAD_PCT || '50');
+          if (Math.abs(spreadPct) >= MIN_MISPRICING && Math.abs(spreadPct) <= MAX_SPREAD && MODE === 'live') {
             const route = [WSOL_MINT, baseMint, WSOL_MINT]; // 2 hops: SOL->base (pool), base->SOL (Jupiter)
             try {
               const jr = await executeRouteViaJito(route, startLamports, {
