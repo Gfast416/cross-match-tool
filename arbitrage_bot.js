@@ -60,10 +60,23 @@ const RPC_TIMEOUT_MS = parseInt(process.env.RPC_TIMEOUT_MS || '20000', 10);
 //   (comma-separated, no spaces). Falls back to RPC_URL if RPC_URLS is unset.
 // The pool rotates endpoints round-robin on every connection request so a single
 // free-tier RPC's rate limit is spread across all of them.
-const RPC_LIST = (process.env.RPC_URLS || process.env.RPC_URL || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+// Configure via env (pick ONE style):
+//   Easiest:  HELIUS_API_KEY=your-key          (single key)
+//             HELIUS_API_KEYS=k1,k2,k3          (multiple free keys -> round-robin, Nx capacity)
+//   Or full:  RPC_URLS="https://x.helius-rpc.com/?api-key=k1,https://y.helius-rpc.com/?api-key=k2"
+//   Falls back to RPC_URL if nothing else set.
+function buildRpcList() {
+  const raw = (process.env.RPC_URLS || process.env.RPC_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (raw.length) {
+    // If it already looks like a URL, use as-is; otherwise treat as bare Helius keys.
+    if (raw[0].startsWith('http')) return raw;
+    return raw.map(k => `https://mainnet.helius-rpc.com/?api-key=${k}`);
+  }
+  const keys = (process.env.HELIUS_API_KEYS || process.env.HELIUS_API_KEY || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (keys.length) return keys.map(k => `https://mainnet.helius-rpc.com/?api-key=${k}`);
+  return [];
+}
+const RPC_LIST = buildRpcList();
 let rpcCursor = 0;
 const rpcFailStreak = new Map(); // endpoint -> consecutive failures
 function rpcEndpoints() { return RPC_LIST.length ? RPC_LIST : [process.env.RPC_URL]; }
