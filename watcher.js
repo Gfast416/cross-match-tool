@@ -11,6 +11,7 @@ const CpAmm = cpMod.CpAmm || cpMod.default;
 
 export const DLMM_PROGRAM = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
 export const DAMMV2_PROGRAM = 'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG';
+export const RAYDIUM_V4_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 
 function getWsUrl(httpUrl) {
   // For Helius etc: https://x/?api-key=K -> wss://x/?api-key=K (NO trailing slash).
@@ -36,8 +37,8 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
     accountKeys = (m.staticAccountKeys || m.accountKeys || []).map(k => k.toBase58());
   }
   const ixs = m.compiledInstructions || m.instructions || [];
-  const progIndices = [DLMM_PROGRAM, DAMMV2_PROGRAM];
-  let poolAddr = null, isDlmm = false;
+  const progIndices = [DLMM_PROGRAM, DAMMV2_PROGRAM, RAYDIUM_V4_PROGRAM];
+  let poolAddr = null, isDlmm = false, isRaydium = false;
   for (const ix of ixs) {
     // versioned: ix.programIdIndex + ix.accountKeyIndexes[]; legacy: ix.programIdIndex + ix.accounts[]
     const pid = accountKeys[ix.programIdIndex];
@@ -46,6 +47,7 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
     if (firstAcct === undefined) continue;
     poolAddr = accountKeys[firstAcct];
     isDlmm = pid === DLMM_PROGRAM;
+    isRaydium = pid === RAYDIUM_V4_PROGRAM;
     break;
   }
   if (!poolAddr) return;
@@ -54,7 +56,17 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
 
   try {
     let info;
-    if (isDlmm) {
+    if (isRaydium) {
+      // Raydium V4 AMM pool account: mintA@0, mintB@32, baseReserve(u64)@256, quoteReserve(u64)@264.
+      const acc = await connection.getAccountInfo(new PublicKey(poolAddr), { commitment: 'confirmed' });
+      if (!acc || !acc.data) return;
+      const buf = acc.data;
+      const mintA = new PublicKey(buf.slice(0, 32)).toBase58();
+      const mintB = new PublicKey(buf.slice(32, 64)).toBase58();
+      const baseReserve = buf.readBigUInt64LE(256);
+      const quoteReserve = buf.readBigUInt64LE(264);
+      info = { poolAddress: poolAddr, venue: 'RAYDIUM', tokenX: mintA, tokenY: mintB, reserveX: baseReserve, reserveY: quoteReserve };
+    } else if (isDlmm) {
       const pool = await DLMM.create(connection, new PublicKey(poolAddr), { cluster: 'mainnet-beta' });
       info = {
         poolAddress: poolAddr, venue: 'DLMM',
@@ -104,6 +116,7 @@ export async function watchNewPools({ rpcUrl, onCandidate, minMispricePct = 3, s
         log('🔌 watcher WS open');
         ws.send(JSON.stringify({ jsonrpc: '2.0', id: ++reqId, method: 'logsSubscribe', params: [{ mentions: [DLMM_PROGRAM] }, { commitment: 'confirmed' }] }));
         ws.send(JSON.stringify({ jsonrpc: '2.0', id: ++reqId, method: 'logsSubscribe', params: [{ mentions: [DAMMV2_PROGRAM] }, { commitment: 'confirmed' }] }));
+        ws.send(JSON.stringify({ jsonrpc: '2.0', id: ++reqId, method: 'logsSubscribe', params: [{ mentions: [RAYDIUM_V4_PROGRAM] }, { commitment: 'confirmed' }] }));
       });
       ws.on('error', (e) => { if (!wsOk) { clearTimeout(t); resolve(); } else log('⚠️ WS error', e.message); });
       ws.on('close', () => { if (wsOk) log('🔌 WS closed — restart recommended'); });
@@ -129,7 +142,7 @@ export async function watchNewPools({ rpcUrl, onCandidate, minMispricePct = 3, s
 
   // --- Polling fallback (no WS needed) ---
   log(`🔄 polling mode: getSignaturesForAddress every ${pollMs}ms`);
-  const programs = [DLMM_PROGRAM, DAMMV2_PROGRAM];
+  const programs = [DLMM_PROGRAM, DAMMV2_PROGRAM, RAYDIUM_V4_PROGRAM];
   let lastSeen = { [DLMM_PROGRAM]: null, [DAMMV2_PROGRAM]: null };
   const loop = async () => {
     for (const prog of programs) {
