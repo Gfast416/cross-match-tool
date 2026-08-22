@@ -824,10 +824,17 @@ function findTriangularMisprice(graph, {
   hub = 'So11111111111111111111111111111111111111112',
   minProfitPct = 0.5,
   maxTokens = 250,        // cap search space (top TVL tokens)
-  feePct = 0.003          // per-hop fee estimate (Raydium ~0.25%, Meteora varies)
+  feePct = 0.003,         // per-hop fee estimate (Raydium ~0.25%, Meteora varies)
+  sanityCapPct = 100      // anything above this is a data/pricing error, not a real arb
 } = {}) {
   const results = [];
   if (!graph.has(hub)) return results;
+
+  // SANITY: if the hub has no valid USD price (e.g. Jupiter price oracle unreachable),
+  // every ratio downstream is garbage (we saw 7,000,000% "arbs"). Refuse to compute.
+  const hubVenues0 = graph.get(hub);
+  const hubUsd = Math.min(...[...hubVenues0.values()].map(v => v.priceUsd));
+  if (!(hubUsd > 0)) { console.warn('[triangular] hub has no valid USD price — skipping (pricing oracle down)'); return results; }
 
   // Rank tokens by TVL to keep search bounded.
   const tokens = [...graph.keys()].filter(t => t !== hub);
@@ -868,7 +875,8 @@ function findTriangularMisprice(graph, {
       const net = gross * feeMult;
       const netPct = (net - 1) * 100;
 
-      if (netPct >= minProfitPct) {
+      // Sanity: a real 3-hop arb is rarely > sanityCapPct%. Above that = pricing garbage.
+      if (netPct >= minProfitPct && netPct <= sanityCapPct) {
         results.push({
           type: 'triangular',
           hub, A, B,

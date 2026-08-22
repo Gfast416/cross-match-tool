@@ -261,34 +261,40 @@ async function scanForCandidates() {
 
   // --- Triangular / multi-hop path finder (A→B→C→A across venues) ---
   try {
-    log('   [scan] building price graph for triangular search...');
-    const poolsByMint = new Map();
-    const addPool = (p, venue) => {
-      const m = p.tokenMint || p.mintA;
-      if (!m) return;
-      if (!poolsByMint.has(m)) poolsByMint.set(m, []);
-      poolsByMint.get(m).push({ venue, tokenMint: m, priceUsd: p.priceUsd || p.price || 0, tvlUsd: p.tvlUsd || p.tvl || 0, volume24h: p.volume24h || 0, raw: p.raw || p });
-    };
-    for (const arr of dlmmPoolMap.values()) arr.forEach(p => addPool(p, 'meteora-dlmm'));
-    for (const arr of dammPoolMap.values()) arr.forEach(p => addPool(p, 'meteora-damm'));
-    (raydiumPools || []).forEach(p => addPool(p, 'raydium'));
-    (orcaPools || []).forEach(p => addPool(p, 'orca'));
+    // Triangular math needs a valid USD oracle. If Jupiter prices are empty (oracle down),
+    // every computed spread is garbage (we saw 7,000,000% "arbs"). Skip until prices recover.
+    if (Object.keys(jupiterPrices || {}).length === 0) {
+      log('   [scan] triangular: skipped (no Jupiter USD prices — oracle down)');
+    } else {
+      log('   [scan] building price graph for triangular search...');
+      const poolsByMint = new Map();
+      const addPool = (p, venue) => {
+        const m = p.tokenMint || p.mintA;
+        if (!m) return;
+        if (!poolsByMint.has(m)) poolsByMint.set(m, []);
+        poolsByMint.get(m).push({ venue, tokenMint: m, priceUsd: p.priceUsd || p.price || 0, tvlUsd: p.tvlUsd || p.tvl || 0, volume24h: p.volume24h || 0, raw: p.raw || p });
+      };
+      for (const arr of dlmmPoolMap.values()) arr.forEach(p => addPool(p, 'meteora-dlmm'));
+      for (const arr of dammPoolMap.values()) arr.forEach(p => addPool(p, 'meteora-damm'));
+      (raydiumPools || []).forEach(p => addPool(p, 'raydium'));
+      (orcaPools || []).forEach(p => addPool(p, 'orca'));
 
-    const graph = buildPriceGraph(poolsByMint);
-    const tri = findTriangularMisprice(graph, { hub: WSOL_MINT, minProfitPct: MIN_MISPRICING, maxTokens: 300 });
-    log(`   [scan] triangular: ${tri.length} opportunity(s)`);
-    for (const t of tri.slice(0, 10)) {
-      candidates.push({
-        type: 'triangular',
-        baseMint: t.A,
-        tokenMint: t.A,
-        symbol: `${t.A.slice(0,4)}→${t.B.slice(0,4)}→SOL`,
-        mispricingPct: t.netPct,
-        netPct: t.netPct,
-        route: t.route,
-        source: 'triangular',
-        tri
-      });
+      const graph = buildPriceGraph(poolsByMint);
+      const tri = findTriangularMisprice(graph, { hub: WSOL_MINT, minProfitPct: MIN_MISPRICING, maxTokens: 300 });
+      log(`   [scan] triangular: ${tri.length} opportunity(s)`);
+      for (const t of tri.slice(0, 10)) {
+        candidates.push({
+          type: 'triangular',
+          baseMint: t.A,
+          tokenMint: t.A,
+          symbol: `${t.A.slice(0,4)}→${t.B.slice(0,4)}→SOL`,
+          mispricingPct: t.netPct,
+          netPct: t.netPct,
+          route: t.route,
+          source: 'triangular',
+          tri
+        });
+      }
     }
   } catch (e) {
     warn(`[scan] triangular check failed: ${e.message}`);
