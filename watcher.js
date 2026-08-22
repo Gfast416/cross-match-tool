@@ -61,6 +61,7 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
     }
     await onCandidate({ ...info, signature: sig, logs });
   } catch (e) {
+    if (process.env.WATCH_DEBUG) log('⚠️ handleTx pool read failed:', e.message);
     // pool may not be fully initialized yet — ignore
   }
 }
@@ -75,7 +76,7 @@ export async function watchNewPools({ rpcUrl, onCandidate, minMispricePct = 3, s
   const connection = new Connection(rpcUrl, 'confirmed');
   const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
-  const isNew = (logs) => logs.some(l => /InitializeLbPair|InitializePool|AddLiquiditySingleSide|SingleSide/i.test(l));
+  const isNew = (logs) => logs.some(l => /InitializeLbPair|InitializePool|AddLiquidity|Initialize|SingleSide|Swap|CollectFee/i.test(l));
 
   // --- Try WebSocket first ---
   try {
@@ -100,7 +101,10 @@ export async function watchNewPools({ rpcUrl, onCandidate, minMispricePct = 3, s
         const v = msg.params?.result?.value;
         const logs = v?.logs || [];
         const sig = v?.signature;
-        if (!isNew(logs) || !sig || seen.has(sig)) return;
+        if (!sig) return;
+        // DEBUG: count all meteora-program txs seen
+        if (process.env.WATCH_DEBUG) console.log(`[watch-dbg] tx ${sig.slice(0,8)} logs=${logs.length} newMatch=${isNew(logs)}`);
+        if (!isNew(logs) || seen.has(sig)) return;
         seen.add(sig);
         handleTx(connection, sig, logs, onCandidate, minMispricePct, seen).catch(e => log('⚠️ handleTx', e.message));
       });
