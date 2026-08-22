@@ -7,7 +7,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 const dlmmMod = await import('@meteora-ag/dlmm');
 const DLMM = dlmmMod.default || dlmmMod.DLMM;
 const cpMod = await import('@meteora-ag/cp-amm-sdk');
-const CpAmm = cpMod.default || cpMod.CpAmm;
+const CpAmm = cpMod.CpAmm || cpMod.default;
 
 export const DLMM_PROGRAM = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
 export const DAMMV2_PROGRAM = 'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG';
@@ -24,10 +24,17 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
   catch (e) { return; }
   if (!tx) return;
   const m = tx.transaction.message;
-  // Correct account-key resolution for both legacy + v0 versioned txs.
-  const accountKeys = (typeof m.getAccountKeys === 'function')
-    ? m.getAccountKeys().staticAccountKeys.map(k => k.toBase58())
-    : (m.accountKeys || m.staticAccountKeys || []).map(k => k.toBase58());
+  // Resolve account keys. Versioned txs with Address Lookup Tables need resolution;
+  // if getAccountKeys() throws (ALT not resolved), fall back to staticAccountKeys — the
+  // Meteora PROGRAM ID is always in the static keys, so we can still detect + extract pool.
+  let accountKeys;
+  try {
+    accountKeys = (typeof m.getAccountKeys === 'function')
+      ? m.getAccountKeys().staticAccountKeys.map(k => k.toBase58())
+      : (m.accountKeys || m.staticAccountKeys || []).map(k => k.toBase58());
+  } catch {
+    accountKeys = (m.staticAccountKeys || m.accountKeys || []).map(k => k.toBase58());
+  }
   const ixs = m.compiledInstructions || m.instructions || [];
   const progIndices = [DLMM_PROGRAM, DAMMV2_PROGRAM];
   let poolAddr = null, isDlmm = false;
