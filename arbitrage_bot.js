@@ -1234,8 +1234,9 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
           // 3) On-chain USD price of base (reverse): anchor price * (base per anchor from reserves).
           //    priceXinY = anchor per base (if anchor is X) or base per anchor (if anchor is Y).
           let baseUsdOnchain;
-          if (info.tokenX === anchorMint) baseUsdOnchain = anchorUsd / onchain.priceXinY; // anchor=base of priceXinY
-          else baseUsdOnchain = anchorUsd * onchain.priceXinY;       // anchor=quote of priceXinY
+          // priceXinY = reserveY/reserveX = (quote token per base token).
+          // anchor is WSOL/USDC. base USD = anchorUsd / (base per anchor) = anchorUsd / priceXinY.
+          baseUsdOnchain = anchorUsd / onchain.priceXinY;
 
           if (!baseUsdOnchain || !baseUsdJup || !isFinite(baseUsdOnchain) || !isFinite(baseUsdJup)) {
             if (process.env.WATCH_DEBUG) console.log(`   ⚪ price compute failed — reserveX=${info.reserveX} reserveY=${info.reserveY} priceXinY=${onchain.priceXinY} basePerSol=${basePerSol} onchain=$${baseUsdOnchain} jup=$${baseUsdJup}`);
