@@ -56,21 +56,19 @@ async function decodePoolAny(pickConn, poolAddr, venue) {
     const conn = pickConn();
     const pool = await withRetry(() => DLMM.create(conn, pk, { cluster: 'mainnet-beta' }));
     const lb = pool.lbPair;
-    const rx = lb.reserveXAmount ?? lb.reserveX;
-    const ry = lb.reserveYAmount ?? lb.reserveY;
-    // If reserves are not numeric (we guessed wrong field), dump the real shape for diagnosis.
-    if (rx == null || ry == null || isNaN(Number(rx)) || isNaN(Number(ry))) {
-      const allKeys = Object.keys(lb);
-      console.warn(`⚠️ DLMM reserve field mismatch on ${poolAddr.slice(0,8)}. ALL lbPair keys: ${allKeys.join(', ')}`);
-      for (const k of allKeys) { if (/reserve|amount|vault|xAmount|yAmount/i.test(k)) console.warn(`   lbPair.${k} = ${String(lb[k]).slice(0,40)}`); }
-      throw new Error('reserve field unknown');
-    }
+    // Per Meteora docs: lbPair.reserveX/reserveY are VAULT pubkeys, NOT amounts.
+    // Real reserves = token balances of those vault accounts.
+    const [ax, ay] = await Promise.all([
+      conn.getTokenAccountBalance(new PublicKey(lb.reserveX)),
+      conn.getTokenAccountBalance(new PublicKey(lb.reserveY)),
+    ]);
+    const rx = BigInt(ax.value.amount);
+    const ry = BigInt(ay.value.amount);
+    if (rx <= 0n || ry <= 0n) throw new Error('vault balance zero');
     return {
       poolAddress: poolAddr, venue: 'DLMM',
       tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
-      reserveX: typeof rx === 'bigint' ? rx : BigInt(rx?.toString?.() || '0'),
-      reserveY: typeof ry === 'bigint' ? ry : BigInt(ry?.toString?.() || '0'),
-      binStep: lb.binStep
+      reserveX: rx, reserveY: ry, binStep: lb.binStep
     };
   }
   // DAMMv2
