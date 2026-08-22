@@ -43,6 +43,22 @@ import { initJito, executeRouteViaJito } from './executor/jito.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
+// ---------- Persistent log file (only important lines) ----------
+// Writes lines containing key markers to watch.log (events) and errors.log (problems),
+// so we keep a compact record without the thousands of [watch-dbg] newPool=false lines.
+import fs from 'fs';
+const LOG_FILE = process.env.WATCH_LOG || 'watch.log';
+const ERR_FILE = process.env.WATCH_ERR_LOG || 'errors.log';
+const IMPORTANT = /🆕 POOL|💡|🚀|⚠️|price compute failed|handleTx pool read failed|WS open|polling mode|MODE=|WATCH executed|bundle/i;
+const _origLog = console.log.bind(console);
+function writeFileSafe(path, line) { try { fs.appendFileSync(path, line + '\n'); } catch {} }
+console.log = (...args) => {
+  const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+  _origLog(line);
+  if (IMPORTANT.test(line)) writeFileSafe(LOG_FILE, `[${new Date().toISOString()}] ${line}`);
+  if (/⚠️|price compute failed|handleTx pool read failed|error|Error/i.test(line)) writeFileSafe(ERR_FILE, `[${new Date().toISOString()}] ${line}`);
+};
+
 // ---------- Config ----------
 const MODE = (process.env.MODE || 'dry-run').toLowerCase();
 const TRADE_AMOUNT_SOL = parseFloat(process.env.TRADE_AMOUNT_SOL || '0.5');
