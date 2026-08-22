@@ -1233,7 +1233,7 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
           const anchorMint = hasWsol ? WSOL_MINT : hasUsdc ? USDC_MINT : null;
           if (!anchorMint) { dbg(`pool ${info.poolAddress.slice(0,8)} no WSOL/USDC anchor — skip`); return; }
           const baseMint = info.tokenX === anchorMint ? info.tokenY : info.tokenX;
-          log(`\n🆕 POOL ${info.venue} ${info.poolAddress.slice(0,10)} base=${baseMint.slice(0,6)} anchor=${anchorMint.slice(0,4)}`);
+          log(`\n>>> 🆕 POOL ${info.venue} ${info.poolAddress.slice(0,10)} base=${baseMint.slice(0,6)} anchor=${anchorMint.slice(0,4)}`);
 
           // 1) On-chain price of base token (reverse from reserves).
           const onchain = { tokenX: info.tokenX, tokenY: info.tokenY, reserveX: info.reserveX, reserveY: info.reserveY, priceXinY: (Number(info.reserveY)/Math.pow(10,9)) / (Number(info.reserveX)/Math.pow(10,9)) };
@@ -1259,7 +1259,7 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
             return;
           }
           const spreadPct = ((baseUsdJup - baseUsdOnchain) / baseUsdOnchain) * 100;
-          log(`   💡 onchain $${baseUsdOnchain.toFixed(6)} vs jupiter $${baseUsdJup.toFixed(6)} -> spread ${spreadPct.toFixed(2)}%`);
+          log(`   >>> 💡 onchain $${baseUsdOnchain.toFixed(6)} vs jupiter $${baseUsdJup.toFixed(6)} -> spread ${spreadPct.toFixed(2)}%`);
 
           // 4) If mispriced beyond threshold, execute atomically via Jito bundle.
           //    Buy the base token CHEAP in the newly-detected on-chain pool, sell it on Jupiter.
@@ -1270,7 +1270,7 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
                 poolAddress: info.poolAddress, venue: info.venue,
                 tipLamports: Number(process.env.JITO_TIP_LAMPORTS || 2000)
               });
-              log(`   🚀 WATCH executed (Jito bundle): ${jr.bundleId}`);
+              log(`   >>> 🚀 WATCH executed (Jito bundle): ${jr.bundleId}`);
               log(`   https://explorer.jito.wtf/bundle/${jr.bundleId}`);
             } catch (je) {
               warn(`   ⚠️ Jito failed (${je.message}) — skip`);

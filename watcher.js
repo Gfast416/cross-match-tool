@@ -166,8 +166,9 @@ export async function watchNewPools({ rpcUrls = [], onCandidate, seen = new Set(
         const sig = v?.signature;
         if (!sig || seen.has('sig:' + sig)) return;
         seen.add('sig:' + sig);
-        if (process.env.WATCH_DEBUG) console.log(`[watch-dbg] tx ${sig.slice(0,8)} newPool=${isNewPool(logs)}`);
-        if (!isNewPool(logs)) return;   // only enqueue real pool creation
+        const np = isNewPool(logs);
+        if (np && process.env.WATCH_DEBUG) console.log(`[watch-dbg] tx ${sig.slice(0,8)} newPool=true`);
+        if (!np) return;   // only enqueue real pool creation (no per-tx spam)
         queue.push(() => handleTx(pickConn, sig, logs, onCandidate, seen).catch(e => log('⚠️ handleTx', e.message)));
         pump();
       });
