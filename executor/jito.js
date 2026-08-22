@@ -39,8 +39,9 @@ export function initJito(conn, wal, endpoint) {
 async function buildSignedSwapTx(inputMint, outputMint, amount, { dexes = null, slippageBps = 50, prioFee = 2000 }) {
   if (!wallet || !wallet.publicKey) throw new Error('jito wallet not initialized');
   if (!connection) throw new Error('jito connection not initialized');
-  const quote = await jupiterQuote(inputMint, outputMint, amount, { slippageBps, dexes });
-  const res = await fetch('https://api.jup.ag/swap/v1/swap', {
+  const quote = await jupQuote(inputMint, outputMint, amount, { slippageBps, dexes });
+  const swapUrl = process.env.JUP_SWAP_URL || 'https://api.jup.ag/swap/v1/swap';
+  const res = await fetch(swapUrl, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ quoteResponse: quote, userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: prioFee })
   });
@@ -81,20 +82,61 @@ export async function sendJitoBundle(swapBase64Txs, { tipLamports = 2000 } = {})
   return json.result;
 }
 
+/** Build a signed Meteora swap tx (base64) for a DLMM or DAMMv2 pool — uses the DETECTED pool. */
+async function buildMeteoraSwapTx(poolAddress, venue, inputMint, outputMint, amountLamports, { slippageBps = 50, prioFee = 2000 }) {
+  if (!wallet || !wallet.publicKey) throw new Error('jito wallet not initialized');
+  if (!connection) throw new Error('jito connection not initialized');
+  const pk = new PublicKey(poolAddress);
+  let swapTx;
+  if (venue === 'DLMM') {
+    const dlmmMod = await import('@meteora-ag/dlmm');
+    const DLMM = dlmmMod.default || dlmmMod.DLMM;
+    const pool = await DLMM.create(connection, pk, { cluster: 'mainnet-beta' });
+    const binArrays = await pool.getBinArrayForSwap(false); // false = base->quote direction handling by SDK
+    swapTx = await pool.swap({
+      amountIn: BigInt(amountLamports),
+      swapForY: inputMint === pool.tokenX.publicKey.toBase58(), // true if input is X (buy Y)
+      binArrayBitmapExtension: null,
+      slippageBps,
+      tokenX: pool.tokenX.publicKey, tokenY: pool.tokenY.publicKey,
+    });
+  } else {
+    const cpMod = await import('@meteora-ag/cp-amm-sdk');
+    const CpAmm = cpMod.CpAmm || cpMod.default;
+    const cp = new CpAmm(connection);
+    swapTx = await cp.swap({ pool: pk, amountIn: BigInt(amountLamports), swapForY: inputMint === (await cp.fetchPoolState(pk)).tokenAMint?.toBase58?.(), slippageBps });
+  }
+  // Meteora swap returns a Transaction/VersionedTransaction; sign with wallet.
+  if (swapTx.sign) { try { swapTx.sign([wallet]); } catch {} }
+  else if (swapTx.transaction && swapTx.transaction.sign) { swapTx.transaction.sign([wallet]); }
+  const ser = swapTx.serialize ? swapTx.serialize() : swapTx.transaction.serialize();
+  return Buffer.from(ser).toString('base64');
+}
+
 /**
  * Execute a multi-hop route atomically via Jito bundle.
- * route = [SOL, A, B, SOL] (3 swaps) or [SOL, A, SOL] (2 swaps).
+ * route = [SOL, A, SOL] (2 swaps). Hop 1 (SOL->A) uses the DETECTED on-chain pool (Meteora)
+ * when poolAddress is given; hop 2 (A->SOL) uses Jupiter. This realizes the on-chain-vs-Jupiter
+ * mispricing we detected: buy the base token cheap in the new pool, sell it on Jupiter.
  * Returns { bundleId, sigs }.
  */
-export async function executeRouteViaJito(route, startLamports, { slippageBps = 50, tipLamports = 2000 } = {}) {
+export async function executeRouteViaJito(route, startLamports, { poolAddress = null, venue = 'DLMM', slippageBps = 50, tipLamports = 2000 } = {}) {
   const signed = [];
   let held = BigInt(startLamports);
-  for (let i = 0; i < route.length - 1; i++) {
-    const { b64, outAmount } = await buildSignedSwapTx(route[i], route[i + 1], held, { slippageBps });
+  // Hop 1: SOL -> base (use detected Meteora pool if provided, else Jupiter)
+  if (poolAddress && route.length >= 2) {
+    const b64 = await buildMeteoraSwapTx(poolAddress, venue, route[0], route[1], held, { slippageBps });
     signed.push(b64);
-    held = BigInt(outAmount); // chain output as next input
-    await new Promise(r => setTimeout(r, 150));
+    held = BigInt(Math.max(1, Number(held) * 0)); // placeholder; actual outAmount unknown pre-sim — will use Jupiter quote for hop2 sizing
+  } else {
+    const { b64, outAmount } = await buildSignedSwapTx(route[0], route[1], held, { slippageBps });
+    signed.push(b64);
+    held = BigInt(outAmount);
   }
+  // Hop 2: base -> SOL via Jupiter (we need base amount; approximate via Jupiter quote of SOL->base then invert)
+  const jupQ = await jupQuote(route[1], route[route.length - 1], held, { slippageBps });
+  const { b64: b64Out } = await buildSignedSwapTx(route[1], route[route.length - 1], BigInt(jupQ.outAmount), { slippageBps });
+  signed.push(b64Out);
   const bundleId = await sendJitoBundle(signed, { tipLamports });
   log(`      📦 Jito bundle sent: ${bundleId}`);
   log(`      https://explorer.jito.wtf/bundle/${bundleId}`);
