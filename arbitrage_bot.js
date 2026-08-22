@@ -37,7 +37,7 @@ import { config as dotenvConfig } from 'dotenv';
 try { dotenvConfig({ path: '.env.bot' }); } catch {}
 try { dotenvConfig({ path: '.env' }); } catch {}
 import BN from 'bn.js';
-import { normalizePool, bestPool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices } from './scanner.js';
+import { normalizePool, bestPool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices, buildPriceGraph, findTriangularMisprice } from './scanner.js';
 import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, quoteSameTokenArb } from './router.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
@@ -257,6 +257,41 @@ async function scanForCandidates() {
     }
   } catch (e) {
     warn(`[scan] cross-dex check failed: ${e.message}`);
+  }
+
+  // --- Triangular / multi-hop path finder (A→B→C→A across venues) ---
+  try {
+    log('   [scan] building price graph for triangular search...');
+    const poolsByMint = new Map();
+    const addPool = (p, venue) => {
+      const m = p.tokenMint || p.mintA;
+      if (!m) return;
+      if (!poolsByMint.has(m)) poolsByMint.set(m, []);
+      poolsByMint.get(m).push({ venue, tokenMint: m, priceUsd: p.priceUsd || p.price || 0, tvlUsd: p.tvlUsd || p.tvl || 0, volume24h: p.volume24h || 0, raw: p.raw || p });
+    };
+    for (const arr of dlmmPoolMap.values()) arr.forEach(p => addPool(p, 'meteora-dlmm'));
+    for (const arr of dammPoolMap.values()) arr.forEach(p => addPool(p, 'meteora-damm'));
+    (raydiumPools || []).forEach(p => addPool(p, 'raydium'));
+    (orcaPools || []).forEach(p => addPool(p, 'orca'));
+
+    const graph = buildPriceGraph(poolsByMint);
+    const tri = findTriangularMisprice(graph, { hub: WSOL_MINT, minProfitPct: MIN_MISPRICING, maxTokens: 300 });
+    log(`   [scan] triangular: ${tri.length} opportunity(s)`);
+    for (const t of tri.slice(0, 10)) {
+      candidates.push({
+        type: 'triangular',
+        baseMint: t.A,
+        tokenMint: t.A,
+        symbol: `${t.A.slice(0,4)}→${t.B.slice(0,4)}→SOL`,
+        mispricingPct: t.netPct,
+        netPct: t.netPct,
+        route: t.route,
+        source: 'triangular',
+        tri
+      });
+    }
+  } catch (e) {
+    warn(`[scan] triangular check failed: ${e.message}`);
   }
 
   return candidates;
@@ -900,6 +935,31 @@ async function cycle() {
 
     for (const c of candidates) {
       const startLamports = Math.floor(TRADE_AMOUNT_SOL * 1e9);
+
+      // --- Triangular / multi-hop (A→B→C→SOL across venues) ---
+      if (c.type === 'triangular') {
+        const net = c.netPct || 0;
+        log(`\n   🔺 TRIANGULAR ${c.symbol} | est net ${net.toFixed(2)}% | route ${c.route.map(m=>m.slice(0,4)).join('→')}`);
+        if (net < MIN_PROFIT_PCT) { log(`      ⚪ below min profit (${MIN_PROFIT_PCT}%) — skip`); continue; }
+        try {
+          if (MODE === 'dry-run') {
+            log(`      ⚪ dry-run: would execute 3-hop SOL→${c.route[1].slice(0,6)}→${c.route[2].slice(0,6)}→SOL via Jupiter`);
+            continue;
+          }
+          if (!wallet) { warn('      ⚠️ wallet not initialized — skip live triangular'); continue; }
+          initRouter(getConn(), wallet);
+          const { quoteTriangularArb, executeTriangularRoute } = await import('./router.js');
+          const q = await quoteTriangularArb({ route: c.route, startLamports });
+          log(`      ⚪ live quote net ${q.netPct.toFixed(2)}% (${q.netSol.toFixed(6)} SOL)`);
+          if (q.netPct < MIN_PROFIT_PCT) { log(`      ⚪ live quote below min — skip`); continue; }
+          const sigs = await executeTriangularRoute({ route: c.route, startLamports });
+          log(`      ✅ TRIANGULAR LIVE done: ${sigs.join(' , ')}`);
+          for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
+        } catch (e) {
+          warn(`      ⚠️ triangular execute failed: ${e.message}`);
+        }
+        continue;
+      }
 
       // --- Adaptive cross-DEX route: mispriced pool quoted in USDC/USDT (not WSOL) ---
       // e.g. METEORA USDC-A misprice -> SOL->USDC->A->SOL via Jupiter (dexes restricted to the mispriced venue for hop2).

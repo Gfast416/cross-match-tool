@@ -789,8 +789,102 @@ async function runFilterPipeline(rawPairs) {
   return l3;
 }
 
+// ---------- Triangular / multi-hop path finder (A→B→C→A across venues) ----------
+// Input: a price graph = Map<mint, Map<venue, priceUsd>> (from all DEXes).
+// Finds 3-token cycles (start/end at SOL or any hub) where buying cheap + selling dear
+// across venues yields profit after fees. This is the "deeper" arb beyond same-token.
+
+/**
+ * Build a price graph: for every pool, record base token -> {venue, quoteToken, usd}.
+ * priceUsd is the USD price of the BASE token (already enriched in the bot).
+ */
+function buildPriceGraph(poolsByMint) {
+  // poolsByMint: Map<mint, Array<{venue, tokenMint, priceUsd, tvlUsd, volume24h, raw}>>
+  const graph = new Map(); // mint -> Map<venue, {priceUsd, tvlUsd, volume24h}>
+  for (const [mint, arr] of poolsByMint) {
+    if (!Array.isArray(arr)) continue;
+    const byVenue = new Map();
+    for (const p of arr) {
+      if (p.priceUsd > 0 && p.tvlUsd >= 0) {
+        byVenue.set(p.venue, { priceUsd: p.priceUsd, tvlUsd: p.tvlUsd, volume24h: p.volume24h || 0 });
+      }
+    }
+    if (byVenue.size) graph.set(mint, byVenue);
+  }
+  return graph;
+}
+
+/**
+ * Find triangular opportunities: hub -> A -> B -> hub (or any 3-token cycle).
+ * We start from a hub (WSOL by default), pick two other tokens A,B such that:
+ *   hub -(cheap)-> A -(cheap)-> B -(expensive)-> hub  yields > fee profit.
+ * Uses venue-specific prices so the route is buildable on real DEX pools.
+ */
+function findTriangularMisprice(graph, {
+  hub = 'So11111111111111111111111111111111111111112',
+  minProfitPct = 0.5,
+  maxTokens = 250,        // cap search space (top TVL tokens)
+  feePct = 0.003          // per-hop fee estimate (Raydium ~0.25%, Meteora varies)
+} = {}) {
+  const results = [];
+  if (!graph.has(hub)) return results;
+
+  // Rank tokens by TVL to keep search bounded.
+  const tokens = [...graph.keys()].filter(t => t !== hub);
+  const ranked = tokens
+    .map(t => {
+      const venues = graph.get(t);
+      let tvl = 0;
+      for (const v of venues.values()) tvl = Math.max(tvl, v.tvlUsd || 0);
+      return { t, tvl };
+    })
+    .sort((a, b) => b.tvl - a.tvl)
+    .slice(0, maxTokens)
+    .map(x => x.t);
+
+  const hubVenues = graph.get(hub);
+  for (const A of ranked) {
+    const aVenues = graph.get(A);
+    if (!aVenues) continue;
+    for (const B of ranked) {
+      if (B === A) continue;
+      const bVenues = graph.get(B);
+      if (!bVenues) continue;
+
+      // We need a path hub->A, A->B, B->hub. Pick the CHEAPEST buy and dearest sell per leg
+      // to estimate max arbitrage (best case). Use price ratios.
+      // hub->A: 1 hub buys (hubUsd / aUsd) of A. Choose min aUsd (cheapest A).
+      const hubToA = Math.min(...[...hubVenues.values()].map(v => v.priceUsd)) /
+                     Math.max(...[...aVenues.values()].map(v => v.priceUsd)); // more A if A is cheap
+      // A->B: 1 A buys (aUsd / bUsd) of B. Choose best ratio.
+      const aToB = Math.max(...[...aVenues.values()].map(v => v.priceUsd)) /
+                   Math.min(...[...bVenues.values()].map(v => v.priceUsd));
+      // B->hub: 1 B buys (bUsd / hubUsd) of hub. Choose max bUsd (dearest B).
+      const bToHub = Math.max(...[...bVenues.values()].map(v => v.priceUsd)) /
+                     Math.min(...[...hubVenues.values()].map(v => v.priceUsd));
+
+      const gross = hubToA * aToB * bToHub;
+      const feeMult = Math.pow(1 - feePct, 3);
+      const net = gross * feeMult;
+      const netPct = (net - 1) * 100;
+
+      if (netPct >= minProfitPct) {
+        results.push({
+          type: 'triangular',
+          hub, A, B,
+          netPct,
+          grossPct: (gross - 1) * 100,
+          route: [hub, A, B, hub]
+        });
+      }
+    }
+  }
+  results.sort((x, y) => y.netPct - x.netPct);
+  return results.slice(0, 20);
+}
+
 // Export for programmatic use
-export { filterLayer1, filterLayer2, filterLayer3, runFullScan, runFilterPipeline, fetchRaydiumPools, fetchOrcaPools, fetchMeteoraPools, fetchJupiterPrices, uploadFile, createRepo, repoExists, retry, normalizePool, findCandidates, generateReport, fetchAllPages, findCrossDexMisprice };
+export { filterLayer1, filterLayer2, filterLayer3, runFullScan, runFilterPipeline, fetchRaydiumPools, fetchOrcaPools, fetchMeteoraPools, fetchJupiterPrices, uploadFile, createRepo, repoExists, retry, normalizePool, findCandidates, generateReport, fetchAllPages, findCrossDexMisprice, buildPriceGraph, findTriangularMisprice };
 
 // Run main if this file is executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {

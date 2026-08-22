@@ -155,3 +155,64 @@ export async function quoteSameTokenArb({ tokenMint, buyVenue, sellVenue, startL
 }
 
 export { WSOL, USDC, USDT };
+
+/**
+ * Simulate a triangular 3-hop route via Jupiter: SOL -> A -> B -> SOL.
+ * route = [SOL, A, B, SOL]. Uses real Jupiter quotes per hop (with NO_ROUTES fallback).
+ */
+export async function quoteTriangularArb({ route, startLamports, slippageBps = 50 }) {
+  const amt = BigInt(startLamports);
+  const quoteHop = async (inputMint, outputMint, amount, dexes) => {
+    try { return await jupQuote(inputMint, outputMint, amount, { slippageBps, dexes }); }
+    catch (e) { if (dexes && /NO_ROUTES_FOUND|400/.test(e.message)) return await jupQuote(inputMint, outputMint, amount, { slippageBps }); throw e; }
+  };
+  let out = amt;
+  const hops = [];
+  for (let i = 0; i < route.length - 1; i++) {
+    const q = await quoteHop(route[i], route[i + 1], out);
+    out = q.outAmount;
+    hops.push(q);
+  }
+  const inSol = Number(amt) / 1e9;
+  const outSol = Number(out) / 1e9;
+  const netPct = ((outSol - inSol) / inSol) * 100;
+  return { inSol, outSol, netPct, netSol: outSol - inSol, hops };
+}
+
+/**
+ * Execute a triangular 3-hop route via Jupiter (3 separate tx, NOT atomic).
+ * Salvage: if any hop fails, dump the held token back to SOL.
+ */
+export async function executeTriangularRoute({ route, startLamports, slippageBps = 50, prioFee = 2000 }) {
+  if (!wallet || !wallet.publicKey) throw new Error('executor wallet not initialized');
+  if (!connection) throw new Error('executor connection not initialized');
+  const sigs = [];
+  let held = BigInt(startLamports);
+  for (let i = 0; i < route.length - 1; i++) {
+    try {
+      const q = await jupQuote(route[i], route[i + 1], held, { slippageBps });
+      const res = await fetch(JUP_SWAP, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quoteResponse: q, userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: prioFee })
+      });
+      if (!res.ok) throw new Error(`jup swap ${res.status}: ${await res.text()}`);
+      const data = await res.json();
+      const tx = VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64'));
+      tx.sign([wallet]);
+      const sig = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
+      await connection.confirmTransaction(sig, 'confirmed');
+      sigs.push(sig);
+      held = BigInt(q.outAmount);
+      await new Promise(r => setTimeout(r, 300));
+    } catch (e) {
+      // salvage: sell whatever we hold back to SOL
+      warn(`[triangular] hop ${i} failed: ${e.message} — salvage ${route[i+1].slice(0,6)}->SOL`);
+      try {
+        const hb = await executeJupiterSwap(route[i + 1], WSOL, held, { dexes: undefined, slippageBps: 500 });
+        sigs.push(hb.sig);
+      } catch (e2) { warn(`[triangular] salvage FAILED — token ${route[i+1].slice(0,6)} may be stuck: ${e2.message}`); }
+      throw e;
+    }
+  }
+  return sigs;
+}
