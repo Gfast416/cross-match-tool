@@ -55,15 +55,22 @@ async function decodePoolAny(pickConn, poolAddr, venue) {
   if (venue === 'DLMM') {
     const conn = pickConn();
     const pool = await withRetry(() => DLMM.create(conn, pk, { cluster: 'mainnet-beta' }));
-    // Meteora SDK: reserveX/reserveY are vault Pubkeys; the actual amounts are reserveXAmount / reserveYAmount (u64/bigint).
-    const rx = pool.lbPair.reserveXAmount ?? pool.lbPair.reserveX;
-    const ry = pool.lbPair.reserveYAmount ?? pool.lbPair.reserveY;
+    const lb = pool.lbPair;
+    const rx = lb.reserveXAmount ?? lb.reserveX;
+    const ry = lb.reserveYAmount ?? lb.reserveY;
+    // If reserves are not numeric (we guessed wrong field), dump the real shape for diagnosis.
+    if (rx == null || ry == null || isNaN(Number(rx)) || isNaN(Number(ry))) {
+      const keys = Object.keys(lb).filter(k => /reserve|amount|vault/i.test(k));
+      console.warn(`⚠️ DLMM reserve field mismatch on ${poolAddr.slice(0,8)}. Candidates: ${keys.join(', ')}`);
+      for (const k of keys) console.warn(`   lbPair.${k} = ${String(lb[k]).slice(0,30)}`);
+      throw new Error('reserve field unknown');
+    }
     return {
       poolAddress: poolAddr, venue: 'DLMM',
       tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
       reserveX: typeof rx === 'bigint' ? rx : BigInt(rx?.toString?.() || '0'),
       reserveY: typeof ry === 'bigint' ? ry : BigInt(ry?.toString?.() || '0'),
-      binStep: pool.lbPair.binStep
+      binStep: lb.binStep
     };
   }
   // DAMMv2
