@@ -38,7 +38,8 @@ try { dotenvConfig({ path: '.env.bot' }); } catch {}
 try { dotenvConfig({ path: '.env' }); } catch {}
 import BN from 'bn.js';
 import { normalizePool, bestPool, findCandidates, findCrossDexMisprice, fetchAllPages, fetchRaydiumPools, fetchOrcaPools, fetchJupiterPrices, buildPriceGraph, findTriangularMisprice } from './scanner.js';
-import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, quoteSameTokenArb } from './router.js';
+import { initRouter, executeAdaptiveRoute, WSOL as ROUTER_WSOL, quoteSameTokenArb, executeTriangularRoute, quoteTriangularArb } from './router.js';
+import { initJito, executeRouteViaJito } from './executor/jito.js';
 
 import { Connection, PublicKey, Keypair, Transaction, TransactionInstruction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
@@ -504,6 +505,8 @@ async function initLive() {
       throw new Error('WALLET_PRIVATE_KEY harus menghasilkan 64 byte (array/base58).');
     }
     wallet = Keypair.fromSecretKey(secretBytes);
+    // Init Jito bundle executor (atomic multi-tx). Uses JITO_ENDPOINT or default block engine.
+    try { initJito(getConn(), wallet); } catch (e) { warn('Jito init skipped:', e.message); }
   }
 }
 
@@ -958,9 +961,17 @@ async function cycle() {
           const q = await quoteTriangularArb({ route: c.route, startLamports });
           log(`      ⚪ live quote net ${q.netPct.toFixed(2)}% (${q.netSol.toFixed(6)} SOL)`);
           if (q.netPct < MIN_PROFIT_PCT) { log(`      ⚪ live quote below min — skip`); continue; }
-          const sigs = await executeTriangularRoute({ route: c.route, startLamports });
-          log(`      ✅ TRIANGULAR LIVE done: ${sigs.join(' , ')}`);
-          for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
+          // Prefer Jito bundle (atomic, anti-sandwich); fall back to Helius 3-tx if Jito fails.
+          try {
+            const jr = await executeRouteViaJito(c.route, startLamports, { tipLamports: Number(process.env.JITO_TIP_LAMPORTS || 2000) });
+            log(`      ✅ TRIANGULAR LIVE done (Jito bundle): ${jr.bundleId}`);
+            log(`      https://explorer.jito.wtf/bundle/${jr.bundleId}`);
+          } catch (je) {
+            warn(`      ⚠️ Jito failed (${je.message}) — falling back to Helius 3-tx`);
+            const sigs = await executeTriangularRoute({ route: c.route, startLamports });
+            log(`      ✅ TRIANGULAR LIVE done (Helius 3-tx): ${sigs.join(' , ')}`);
+            for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
+          }
         } catch (e) {
           warn(`      ⚠️ triangular execute failed: ${e.message}`);
         }
@@ -994,15 +1005,23 @@ async function cycle() {
           }
           if (!wallet) { warn('      ⚠️ wallet not initialized (check WALLET_PRIVATE_KEY) — skip live cross-dex'); continue; }
           initRouter(getConn(), wallet);
-          log(`      ⚠️ cross-dex = 3 separate Jupiter tx (NOT atomic) — token may stick if hop3 fails`);
-          const sigs = await executeAdaptiveRoute({
-            tokenMint: tk,
-            quoteToken: qt,
-            mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined,
-            startLamports
-          });
-          log(`      ✅ CROSS-DEX LIVE done: ${sigs.join(' , ')}`);
-          for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
+          // Build the 3-hop route array SOL->quote->token->quote->SOL for Jito bundle.
+          const route3 = [WSOL_MINT, qt, tk, qt, WSOL_MINT];
+          try {
+            const jr = await executeRouteViaJito(route3, startLamports, { tipLamports: Number(process.env.JITO_TIP_LAMPORTS || 2000) });
+            log(`      ✅ CROSS-DEX LIVE done (Jito bundle): ${jr.bundleId}`);
+            log(`      https://explorer.jito.wtf/bundle/${jr.bundleId}`);
+          } catch (je) {
+            warn(`      ⚠️ Jito failed (${je.message}) — fallback to 3 separate Jupiter tx (NOT atomic)`);
+            const sigs = await executeAdaptiveRoute({
+              tokenMint: tk,
+              quoteToken: qt,
+              mispriceVenueDexes: c.crossDex.meteoraIsCheap ? 'Meteora' : undefined,
+              startLamports
+            });
+            log(`      ✅ CROSS-DEX LIVE done (Helius 3-tx): ${sigs.join(' , ')}`);
+            for (const s of sigs) log(`      https://solscan.io/tx/${s}`);
+          }
         } catch (e) {
           fail('cross-dex execute', e);
         }
