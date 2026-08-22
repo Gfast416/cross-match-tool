@@ -55,10 +55,15 @@ async function decodePoolAny(pickConn, poolAddr, venue) {
   if (venue === 'DLMM') {
     const conn = pickConn();
     const pool = await withRetry(() => DLMM.create(conn, pk, { cluster: 'mainnet-beta' }));
+    // Meteora SDK: reserveX/reserveY are vault Pubkeys; the actual amounts are reserveXAmount / reserveYAmount (u64/bigint).
+    const rx = pool.lbPair.reserveXAmount ?? pool.lbPair.reserveX;
+    const ry = pool.lbPair.reserveYAmount ?? pool.lbPair.reserveY;
     return {
       poolAddress: poolAddr, venue: 'DLMM',
       tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
-      reserveX: pool.lbPair.reserveX, reserveY: pool.lbPair.reserveY, binStep: pool.lbPair.binStep
+      reserveX: typeof rx === 'bigint' ? rx : BigInt(rx?.toString?.() || '0'),
+      reserveY: typeof ry === 'bigint' ? ry : BigInt(ry?.toString?.() || '0'),
+      binStep: pool.lbPair.binStep
     };
   }
   // DAMMv2
