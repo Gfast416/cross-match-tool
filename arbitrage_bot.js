@@ -1237,7 +1237,10 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
           if (info.tokenX === anchorMint) baseUsdOnchain = anchorUsd / onchain.priceXinY; // anchor=base of priceXinY
           else baseUsdOnchain = anchorUsd * onchain.priceXinY;       // anchor=quote of priceXinY
 
-          if (!baseUsdOnchain || !baseUsdJup) { log(`   ⚪ price compute failed — skip`); return; }
+          if (!baseUsdOnchain || !baseUsdJup || !isFinite(baseUsdOnchain) || !isFinite(baseUsdJup)) {
+            if (process.env.WATCH_DEBUG) console.log(`   ⚪ price compute failed — reserveX=${info.reserveX} reserveY=${info.reserveY} priceXinY=${onchain.priceXinY} basePerSol=${basePerSol} onchain=$${baseUsdOnchain} jup=$${baseUsdJup}`);
+            return;
+          }
           const spreadPct = ((baseUsdJup - baseUsdOnchain) / baseUsdOnchain) * 100;
           log(`   💡 onchain $${baseUsdOnchain.toFixed(6)} vs jupiter $${baseUsdJup.toFixed(6)} -> spread ${spreadPct.toFixed(2)}%`);
 
