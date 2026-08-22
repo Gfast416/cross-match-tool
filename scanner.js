@@ -343,6 +343,8 @@ async function fetchJupiterPrices(mints) {
   const prices = {};
   const uniqueMints = [...new Set(mints)].filter(Boolean);
 
+  // Primary oracle: Jupiter price API.
+  let primaryOk = false;
   for (let i = 0; i < uniqueMints.length; i += 50) {
     const batch = uniqueMints.slice(i, i + 50).join(',');
     try {
@@ -350,11 +352,28 @@ async function fetchJupiterPrices(mints) {
       for (const mint in res.data?.data || {}) {
         prices[mint] = Number(res.data.data[mint]?.price || 0);
       }
+      primaryOk = true;
     } catch (err) {
-      console.warn(`[jupiter] batch failed for ${batch}:`, err.message);
+      console.warn(`[jupiter] price batch failed for ${batch}:`, err.message);
     }
   }
+  if (primaryOk) return prices;
 
+  // Fallback oracle 1: CoinGecko (free, no key) — works on networks where price.jup.ag is blocked.
+  try {
+    const ids = uniqueMints.join(',');
+    const res = await retry(async () => api.get(`https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses=${ids}&vs_currencies=usd`));
+    for (const mint in res.data || {}) {
+      const p = res.data[mint]?.usd;
+      if (p) prices[mint] = Number(p);
+    }
+    if (Object.keys(prices).length) { console.warn(`[oracle] CoinGecko fallback supplied ${Object.keys(prices).length} prices`); return prices; }
+  } catch (err) {
+    console.warn(`[coingecko] failed:`, err.message);
+  }
+
+  // Fallback oracle 2: derive USD from USDC-quoted pools already in the graph (done by caller).
+  console.warn('[oracle] all price APIs down — caller must use USDC/USDT pool ratios');
   return prices;
 }
 
