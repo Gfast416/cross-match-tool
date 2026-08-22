@@ -360,12 +360,16 @@ async function fetchJupiterPrices(mints) {
   if (primaryOk) return prices;
 
   // Fallback oracle 1: CoinGecko (free, no key) — works on networks where price.jup.ag is blocked.
+  // Batch 50 mints per request + small delay to avoid CoinGecko free-tier rate limits.
   try {
-    const ids = uniqueMints.join(',');
-    const res = await retry(async () => api.get(`https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses=${ids}&vs_currencies=usd`));
-    for (const mint in res.data || {}) {
-      const p = res.data[mint]?.usd;
-      if (p) prices[mint] = Number(p);
+    for (let i = 0; i < uniqueMints.length; i += 50) {
+      const ids = uniqueMints.slice(i, i + 50).join(',');
+      const res = await retry(async () => api.get(`https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses=${ids}&vs_currencies=usd`));
+      for (const mint in res.data || {}) {
+        const p = res.data[mint]?.usd;
+        if (p) prices[mint] = Number(p);
+      }
+      if (i + 50 < uniqueMints.length) await new Promise(r => setTimeout(r, 600));
     }
     if (Object.keys(prices).length) { console.warn(`[oracle] CoinGecko fallback supplied ${Object.keys(prices).length} prices`); return prices; }
   } catch (err) {
