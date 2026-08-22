@@ -60,9 +60,9 @@ async function decodePoolAny(pickConn, poolAddr, venue) {
     const ry = lb.reserveYAmount ?? lb.reserveY;
     // If reserves are not numeric (we guessed wrong field), dump the real shape for diagnosis.
     if (rx == null || ry == null || isNaN(Number(rx)) || isNaN(Number(ry))) {
-      const keys = Object.keys(lb).filter(k => /reserve|amount|vault/i.test(k));
-      console.warn(`⚠️ DLMM reserve field mismatch on ${poolAddr.slice(0,8)}. Candidates: ${keys.join(', ')}`);
-      for (const k of keys) console.warn(`   lbPair.${k} = ${String(lb[k]).slice(0,30)}`);
+      const allKeys = Object.keys(lb);
+      console.warn(`⚠️ DLMM reserve field mismatch on ${poolAddr.slice(0,8)}. ALL lbPair keys: ${allKeys.join(', ')}`);
+      for (const k of allKeys) { if (/reserve|amount|vault|xAmount|yAmount/i.test(k)) console.warn(`   lbPair.${k} = ${String(lb[k]).slice(0,40)}`); }
       throw new Error('reserve field unknown');
     }
     return {
