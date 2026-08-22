@@ -13,6 +13,7 @@
 // Tip program: T1pyyaTNZsKv2WcRAB8oVnk93mLJw2XzjtVYqCsaHqt  (SOL transfer to a tip account = tip)
 
 import { Connection, VersionedTransaction, SystemProgram, TransactionMessage, PublicKey } from '@solana/web3.js';
+import BN from 'bn.js';
 import { jupQuote } from '../router.js';
 const log = (...a) => console.log('[jito]', ...a);
 const warn = (...a) => console.warn('[jito]', ...a);
@@ -92,14 +93,20 @@ async function buildMeteoraSwapTx(poolAddress, venue, inputMint, outputMint, amo
     const dlmmMod = await import('@meteora-ag/dlmm');
     const DLMM = dlmmMod.default || dlmmMod.DLMM;
     const pool = await DLMM.create(connection, pk, { cluster: 'mainnet-beta' });
-    const binArrays = await pool.getBinArrayForSwap(false); // false = base->quote direction handling by SDK
-    swapTx = await pool.swap({
-      amountIn: BigInt(amountLamports),
-      swapForY: inputMint === pool.tokenX.publicKey.toBase58(), // true if input is X (buy Y)
-      binArrayBitmapExtension: null,
-      slippageBps,
-      tokenX: pool.tokenX.publicKey, tokenY: pool.tokenY.publicKey,
+    const binArrays = await pool.getBinArrayForSwap(inputMint === pool.tokenX.mint.address.toBase58());
+    const swapTx = await pool.swap({
+      inToken: pool.tokenX.mint.address,
+      outToken: pool.tokenY.mint.address,
+      inAmount: new BN(amountLamports),
+      minOutAmount: new BN(0),
+      lbPair: pool.lbPair.publicKey,
+      user: wallet.publicKey,
+      binArraysPubkey: binArrays.map(b => b.publicKey),
     });
+    if (swapTx.sign) { try { swapTx.sign([wallet]); } catch {} }
+    else if (swapTx.transaction && swapTx.transaction.sign) { swapTx.transaction.sign([wallet]); }
+    const ser = swapTx.serialize ? swapTx.serialize() : swapTx.transaction.serialize();
+    return Buffer.from(ser).toString('base64');
   } else {
     const cpMod = await import('@meteora-ag/cp-amm-sdk');
     const CpAmm = cpMod.CpAmm || cpMod.default;
