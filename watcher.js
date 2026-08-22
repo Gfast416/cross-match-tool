@@ -1,7 +1,11 @@
-// watcher.js — real-time detection of new/imbalanced Meteora pools.
+// watcher.js — real-time detection of new pools across MULTIPLE DEXes (Meteora DLMM/DAMMv2 + Raydium V4).
 // Primary: logsSubscribe (WebSocket) for <1s latency.
-// Fallback: poll getSignaturesForAddress every few seconds (works on RPCs that block WS / logsSubscribe, e.g. Helius free 401).
-// For each suspicious tx we read pool reserves on-chain and call onCandidate(poolInfo).
+// Fallback: poll getSignaturesForAddress every few seconds (works on RPCs that block WS).
+//
+// Rate-limit handling (Helius free = strict 429):
+//   - Accepts rpcUrls: string[] (round-robin) so N keys = Nx capacity.
+//   - Limits concurrent tx processing (CONCURRENCY) so we never spam hundreds of reqs/sec.
+//   - Only fetches a tx when its logs indicate a NEW pool (Initialize*), skipping Swap/CollectFee.
 
 import { Connection, PublicKey } from '@solana/web3.js';
 const dlmmMod = await import('@meteora-ag/dlmm');
@@ -13,21 +17,25 @@ export const DLMM_PROGRAM = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
 export const DAMMV2_PROGRAM = 'cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG';
 export const RAYDIUM_V4_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 
+const CONCURRENCY = 3;          // max simultaneous tx evaluations
+const POLL_MS = 4000;           // polling fallback interval
+
 function getWsUrl(httpUrl) {
-  // For Helius etc: https://x/?api-key=K -> wss://x/?api-key=K (NO trailing slash).
   if (httpUrl.startsWith('http')) return httpUrl.replace(/^http/, 'ws');
   return httpUrl;
 }
 
-async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen) {
+// Only fetch txs that actually CREATE a pool (not swaps/fees) — cuts request volume ~20x.
+const isNewPool = (logs) => logs.some(l => /InitializeLbPair|InitializePool|Initialize\b/i.test(l));
+
+async function handleTx(pickConn, sig, logs, onCandidate, seen) {
+  if (!isNewPool(logs)) return;        // skip Swap/CollectFee early — no RPC call
+  const connection = pickConn();
   let tx;
   try { tx = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }); }
   catch (e) { return; }
   if (!tx) return;
   const m = tx.transaction.message;
-  // Resolve account keys. Versioned txs with Address Lookup Tables need resolution;
-  // if getAccountKeys() throws (ALT not resolved), fall back to staticAccountKeys — the
-  // Meteora PROGRAM ID is always in the static keys, so we can still detect + extract pool.
   let accountKeys;
   try {
     accountKeys = (typeof m.getAccountKeys === 'function')
@@ -40,7 +48,6 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
   const progIndices = [DLMM_PROGRAM, DAMMV2_PROGRAM, RAYDIUM_V4_PROGRAM];
   let poolAddr = null, isDlmm = false, isRaydium = false;
   for (const ix of ixs) {
-    // versioned: ix.programIdIndex + ix.accountKeyIndexes[]; legacy: ix.programIdIndex + ix.accounts[]
     const pid = accountKeys[ix.programIdIndex];
     if (!pid || !progIndices.includes(pid)) continue;
     const firstAcct = ix.accountKeyIndexes ? ix.accountKeyIndexes[0] : ix.accounts?.[0];
@@ -57,8 +64,8 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
   try {
     let info;
     if (isRaydium) {
-      // Raydium V4 AMM pool account: mintA@0, mintB@32, baseReserve(u64)@256, quoteReserve(u64)@264.
-      const acc = await connection.getAccountInfo(new PublicKey(poolAddr), { commitment: 'confirmed' });
+      const conn = pickConn();
+      const acc = await conn.getAccountInfo(new PublicKey(poolAddr), { commitment: 'confirmed' });
       if (!acc || !acc.data) return;
       const buf = acc.data;
       const mintA = new PublicKey(buf.slice(0, 32)).toBase58();
@@ -67,7 +74,8 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
       const quoteReserve = buf.readBigUInt64LE(264);
       info = { poolAddress: poolAddr, venue: 'RAYDIUM', tokenX: mintA, tokenY: mintB, reserveX: baseReserve, reserveY: quoteReserve };
     } else if (isDlmm) {
-      const pool = await DLMM.create(connection, new PublicKey(poolAddr), { cluster: 'mainnet-beta' });
+      const conn = pickConn();
+      const pool = await DLMM.create(conn, new PublicKey(poolAddr), { cluster: 'mainnet-beta' });
       info = {
         poolAddress: poolAddr, venue: 'DLMM',
         tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
@@ -75,7 +83,8 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
         binStep: pool.lbPair.binStep
       };
     } else {
-      const cp = new CpAmm(connection);
+      const conn = pickConn();
+      const cp = new CpAmm(conn);
       const ps = await cp.fetchPoolState(new PublicKey(poolAddr));
       info = {
         poolAddress: poolAddr, venue: 'DAMMv2',
@@ -86,37 +95,35 @@ async function handleTx(connection, sig, logs, onCandidate, minMispricePct, seen
     await onCandidate({ ...info, signature: sig, logs });
   } catch (e) {
     if (process.env.WATCH_DEBUG) console.warn('⚠️ handleTx pool read failed:', e.message);
-    // pool may not be fully initialized yet — ignore
   }
 }
 
-/**
- * Watch new Meteora pools.
- * Tries WebSocket (logsSubscribe) first; if it fails (e.g. 401 on Helius free), falls back to
- * polling getSignaturesForAddress every `pollMs` ms. Either way, onCandidate is called for
- * each new pool with its on-chain reserves.
- */
-export async function watchNewPools({ rpcUrl, onCandidate, minMispricePct = 3, seen = new Set(), wsUrl, pollMs = 3000 }) {
-  const connection = new Connection(rpcUrl, 'confirmed');
+export async function watchNewPools({ rpcUrls = [], onCandidate, seen = new Set(), wsUrl, pollMs = POLL_MS }) {
+  const urls = Array.isArray(rpcUrls) ? rpcUrls : (rpcUrls ? [rpcUrls] : []);
+  if (!urls.length) urls.push('https://api.mainnet-beta.solana.com');
+  const connections = urls.map(u => new Connection(u, 'confirmed'));
+  let rr = 0;
+  const pickConn = () => connections[rr++ % connections.length];   // round-robin across RPC keys
   const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
-  const isNew = (logs) => logs.some(l => /InitializeLbPair|InitializePool|AddLiquidity|Initialize|SingleSide|Swap|CollectFee/i.test(l));
-
-  // --- Try WebSocket first ---
+  // --- Try WebSocket first (uses first RPC's WS endpoint) ---
   try {
     const WebSocket = (await import('ws')).default;
-    const endpoint = wsUrl || getWsUrl(rpcUrl);
+    const endpoint = wsUrl || getWsUrl(urls[0]);
     const ws = new WebSocket(endpoint);
-    let reqId = 0;
-    let wsOk = false;
+    let reqId = 0, wsOk = false;
+    let active = 0;
+    const queue = [];
+    const pump = () => { while (active < CONCURRENCY && queue.length) { active++; const job = queue.shift(); job().finally(() => { active--; pump(); }); } };
+
     await new Promise((resolve) => {
       const t = setTimeout(() => { if (!wsOk) { try { ws.close(); } catch {} resolve(); } }, 4000);
       ws.on('open', () => {
         wsOk = true; clearTimeout(t);
-        log('🔌 watcher WS open');
-        ws.send(JSON.stringify({ jsonrpc: '2.0', id: ++reqId, method: 'logsSubscribe', params: [{ mentions: [DLMM_PROGRAM] }, { commitment: 'confirmed' }] }));
-        ws.send(JSON.stringify({ jsonrpc: '2.0', id: ++reqId, method: 'logsSubscribe', params: [{ mentions: [DAMMV2_PROGRAM] }, { commitment: 'confirmed' }] }));
-        ws.send(JSON.stringify({ jsonrpc: '2.0', id: ++reqId, method: 'logsSubscribe', params: [{ mentions: [RAYDIUM_V4_PROGRAM] }, { commitment: 'confirmed' }] }));
+        log(`🔌 watcher WS open (${connections.length} RPC key(s))`);
+        for (const prog of [DLMM_PROGRAM, DAMMV2_PROGRAM, RAYDIUM_V4_PROGRAM]) {
+          ws.send(JSON.stringify({ jsonrpc: '2.0', id: ++reqId, method: 'logsSubscribe', params: [{ mentions: [prog] }, { commitment: 'confirmed' }] }));
+        }
       });
       ws.on('error', (e) => { if (!wsOk) { clearTimeout(t); resolve(); } else log('⚠️ WS error', e.message); });
       ws.on('close', () => { if (wsOk) log('🔌 WS closed — restart recommended'); });
@@ -126,45 +133,38 @@ export async function watchNewPools({ rpcUrl, onCandidate, minMispricePct = 3, s
         const v = msg.params?.result?.value;
         const logs = v?.logs || [];
         const sig = v?.signature;
-        if (!sig) return;
-        // DEBUG: count all meteora-program txs seen
-        if (process.env.WATCH_DEBUG) console.log(`[watch-dbg] tx ${sig.slice(0,8)} logs=${logs.length} newMatch=${isNew(logs)}`);
-        if (!isNew(logs) || seen.has(sig)) return;
-        seen.add(sig);
-        handleTx(connection, sig, logs, onCandidate, minMispricePct, seen).catch(e => log('⚠️ handleTx', e.message));
+        if (!sig || seen.has('sig:' + sig)) return;
+        seen.add('sig:' + sig);
+        if (process.env.WATCH_DEBUG) console.log(`[watch-dbg] tx ${sig.slice(0,8)} newPool=${isNewPool(logs)}`);
+        if (!isNewPool(logs)) return;   // only enqueue real pool creation
+        queue.push(() => handleTx(pickConn, sig, logs, onCandidate, seen).catch(e => log('⚠️ handleTx', e.message)));
+        pump();
       });
     });
-    if (wsOk) return ws; // WS mode active
+    if (wsOk) return ws;
     log('⚠️ WS unavailable — falling back to polling mode');
   } catch (e) {
     log('⚠️ WS init failed:', e.message, '— falling back to polling');
   }
 
-  // --- Polling fallback (no WS needed) ---
-  log(`🔄 polling mode: getSignaturesForAddress every ${pollMs}ms`);
+  // --- Polling fallback ---
+  log(`🔄 polling mode: getSignaturesForAddress every ${pollMs}ms (${connections.length} RPC key(s))`);
   const programs = [DLMM_PROGRAM, DAMMV2_PROGRAM, RAYDIUM_V4_PROGRAM];
-  let lastSeen = { [DLMM_PROGRAM]: null, [DAMMV2_PROGRAM]: null };
+  let active = 0;
   const loop = async () => {
     for (const prog of programs) {
       try {
-        const sigs = await connection.getSignaturesForAddress(new PublicKey(prog), { limit: 8, commitment: 'confirmed', before: lastSeen[prog] || undefined });
-        if (sigs.length) {
-          lastSeen[prog] = sigs[0].signature; // anchor for next poll (newest first)
-          // Process newest-last so we evaluate in chronological order
-          for (const s of sigs.slice().reverse()) {
-            if (seen.has('sig:' + s.signature)) continue;
-            seen.add('sig:' + s.signature);
-            const tx = await connection.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }).catch(() => null);
-            if (!tx) continue;
-            const logs = tx.meta?.logMessages || [];
-            if (!isNew(logs)) continue;
-            handleTx(connection, s.signature, logs, onCandidate, minMispricePct, seen).catch(e => log('⚠️ handleTx', e.message));
-            await new Promise(r => setTimeout(r, 200));
-          }
+        const conn = pickConn();
+        const sigs = await conn.getSignaturesForAddress(new PublicKey(prog), { limit: 6, commitment: 'confirmed' });
+        for (const s of sigs.slice().reverse()) {
+          if (seen.has('sig:' + s.signature)) continue;
+          seen.add('sig:' + s.signature);
+          if (active >= CONCURRENCY) break;
+          active++;
+          handleTx(pickConn, s.signature, [], onCandidate, seen).finally(() => active--);
+          await new Promise(r => setTimeout(r, 300));
         }
-      } catch (e) {
-        log(`⚠️ poll ${prog.slice(0, 6)}:`, e.message);
-      }
+      } catch (e) { log(`⚠️ poll ${prog.slice(0,6)}:`, e.message); }
     }
     setTimeout(loop, pollMs);
   };

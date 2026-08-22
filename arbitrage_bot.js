@@ -1189,10 +1189,10 @@ if (process.argv.includes('test') || process.env.TEST_MET === '1') {
     const { watchNewPools } = await import('./watcher.js');
     const { mintUsdFromPool } = await import('./onchain.js');
     const { jupQuote } = await import('./router.js');
-    const RPC_URL = rpcEndpoints()[0] || 'https://api.mainnet-beta.solana.com';
-    log(`\n👁️ WATCH MODE — real-time Meteora pool detection (execute on misprice > ${MIN_MISPRICING}%)`);
+    const RPCS = rpcEndpoints();   // array of Helius free keys -> round-robin, Nx capacity
+    log(`\n👁️ WATCH MODE — multi-DEX pool detection (${RPCS.length} RPC key(s), execute on misprice > ${MIN_MISPRICING}%)`);
     watchNewPools({
-      rpcUrl: RPC_URL,
+      rpcUrls: RPCS,
       minMispricePct: MIN_MISPRICING,
       onCandidate: async (info) => {
         try {
