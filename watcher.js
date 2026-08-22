@@ -25,6 +25,15 @@ function getWsUrl(httpUrl) {
   return httpUrl;
 }
 
+// Retry a pool read up to 3x with 1s delay — new pools take 1-2s to be indexed by RPC.
+async function withRetry(fn, tries = 3, delayMs = 1000) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); } catch (e) { lastErr = e; if (i < tries - 1) await new Promise(r => setTimeout(r, delayMs)); }
+  }
+  throw lastErr;
+}
+
 // Only fetch txs that actually CREATE a pool (not swaps/fees) — cuts request volume ~20x.
 const isNewPool = (logs) => logs.some(l => /InitializeLbPair|InitializePool|Initialize\b/i.test(l));
 
@@ -65,7 +74,7 @@ async function handleTx(pickConn, sig, logs, onCandidate, seen) {
     let info;
     if (isRaydium) {
       const conn = pickConn();
-      const acc = await conn.getAccountInfo(new PublicKey(poolAddr), { commitment: 'confirmed' });
+      const acc = await withRetry(() => conn.getAccountInfo(new PublicKey(poolAddr), { commitment: 'confirmed' }));
       if (!acc || !acc.data) return;
       const buf = acc.data;
       const mintA = new PublicKey(buf.slice(0, 32)).toBase58();
@@ -75,7 +84,7 @@ async function handleTx(pickConn, sig, logs, onCandidate, seen) {
       info = { poolAddress: poolAddr, venue: 'RAYDIUM', tokenX: mintA, tokenY: mintB, reserveX: baseReserve, reserveY: quoteReserve };
     } else if (isDlmm) {
       const conn = pickConn();
-      const pool = await DLMM.create(conn, new PublicKey(poolAddr), { cluster: 'mainnet-beta' });
+      const pool = await withRetry(() => DLMM.create(conn, new PublicKey(poolAddr), { cluster: 'mainnet-beta' }));
       info = {
         poolAddress: poolAddr, venue: 'DLMM',
         tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
@@ -85,7 +94,7 @@ async function handleTx(pickConn, sig, logs, onCandidate, seen) {
     } else {
       const conn = pickConn();
       const cp = new CpAmm(conn);
-      const ps = await cp.fetchPoolState(new PublicKey(poolAddr));
+      const ps = await withRetry(() => cp.fetchPoolState(new PublicKey(poolAddr)));
       info = {
         poolAddress: poolAddr, venue: 'DAMMv2',
         tokenX: ps.tokenAMint?.toBase58?.() || ps.tokenA?.address, tokenY: ps.tokenBMint?.toBase58?.() || ps.tokenB?.address,
