@@ -34,12 +34,11 @@ async function withRetry(fn, tries = 3, delayMs = 1000) {
   throw lastErr;
 }
 
-// Try each DEX decoder for a pool address; pools are sometimes mislabeled by the
-// instruction account index, so fall back across DLMM / DAMMv2 / Raydium.
-async function decodePoolAny(pickConn, poolAddr) {
+// Decode a pool by its known venue (do NOT cross-decode — Raydium's raw layout overlaps
+// DLMM/DAMMv2 account bytes and would misread mints as reserves).
+async function decodePoolAny(pickConn, poolAddr, venue) {
   const pk = new PublicKey(poolAddr);
-  // Raydium V4 (fixed layout)
-  try {
+  if (venue === 'RAYDIUM') {
     const conn = pickConn();
     const acc = await withRetry(() => conn.getAccountInfo(pk, { commitment: 'confirmed' }));
     if (acc && acc.data && acc.data.length > 300) {
@@ -51,9 +50,9 @@ async function decodePoolAny(pickConn, poolAddr) {
       if (baseReserve > 0n && quoteReserve > 0n)
         return { poolAddress: poolAddr, venue: 'RAYDIUM', tokenX: mintA, tokenY: mintB, reserveX: baseReserve, reserveY: quoteReserve };
     }
-  } catch {}
-  // DLMM
-  try {
+    throw new Error('raydium account empty');
+  }
+  if (venue === 'DLMM') {
     const conn = pickConn();
     const pool = await withRetry(() => DLMM.create(conn, pk, { cluster: 'mainnet-beta' }));
     return {
@@ -61,18 +60,16 @@ async function decodePoolAny(pickConn, poolAddr) {
       tokenX: pool.tokenX.publicKey.toBase58(), tokenY: pool.tokenY.publicKey.toBase58(),
       reserveX: pool.lbPair.reserveX, reserveY: pool.lbPair.reserveY, binStep: pool.lbPair.binStep
     };
-  } catch {}
+  }
   // DAMMv2
-  try {
-    const conn = pickConn();
-    const cp = new CpAmm(conn);
-    const ps = await withRetry(() => cp.fetchPoolState(pk));
-    return {
-      poolAddress: poolAddr, venue: 'DAMMv2',
-      tokenX: ps.tokenAMint?.toBase58?.() || ps.tokenA?.address, tokenY: ps.tokenBMint?.toBase58?.() || ps.tokenB?.address,
-      reserveX: ps.tokenAAmount, reserveY: ps.tokenBAmount
-    };
-  } catch (e) { throw e; }
+  const conn = pickConn();
+  const cp = new CpAmm(conn);
+  const ps = await withRetry(() => cp.fetchPoolState(pk));
+  return {
+    poolAddress: poolAddr, venue: 'DAMMv2',
+    tokenX: ps.tokenAMint?.toBase58?.() || ps.tokenA?.address, tokenY: ps.tokenBMint?.toBase58?.() || ps.tokenB?.address,
+    reserveX: ps.tokenAAmount, reserveY: ps.tokenBAmount
+  };
 }
 
 // Only fetch txs that actually CREATE a pool (not swaps/fees) — cuts request volume ~20x.
@@ -112,7 +109,8 @@ async function handleTx(pickConn, sig, logs, onCandidate, seen) {
   seen.add('pool:' + poolAddr);
 
   try {
-    const info = await decodePoolAny(pickConn, poolAddr);
+    const venue = isRaydium ? 'RAYDIUM' : isDlmm ? 'DLMM' : 'DAMMv2';
+    const info = await decodePoolAny(pickConn, poolAddr, venue);
     await onCandidate({ ...info, signature: sig, logs });
   } catch (e) {
     if (process.env.WATCH_DEBUG) console.warn(`⚠️ handleTx pool read failed [${isDlmm ? 'DLMM' : isRaydium ? 'RAYDIUM' : 'DAMMv2'}] ${poolAddr?.slice(0,8)}:`, e.message);
